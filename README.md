@@ -81,7 +81,7 @@ The main outcomes were:
 **Core skills:** Process modeling · Embedded/process control concepts · PID-based optimization · Software development · Silicone additive manufacturing · Experimental validation
 
 
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---
 
 
 ## Silicone Additive Manufacturing
