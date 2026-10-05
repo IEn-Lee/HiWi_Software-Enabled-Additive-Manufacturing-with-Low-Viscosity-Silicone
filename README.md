@@ -40,7 +40,7 @@ A key objective was to maintain more consistent material conditions throughout t
 I developed a predictive process-modeling framework and applied PID-based optimization to improve consistency across extrusion segments.
 
 <p align="center">
-  <img src="images/Silicone_Material_Conditioning_Stability.png" alt="Residence-time stability index before and after process optimization" width="850">
+  <img src="Images/Silicone_Material_Conditioning_Stability.png" alt="Residence-time stability index before and after process optimization" width="850">
 </p>
 
 *Figure 1. Comparison of the residence-time stability index across extrusion segments before and after optimization.*
@@ -57,7 +57,7 @@ The optimized profile indicates more consistent material conditioning over the p
 To evaluate how the process optimization translated into practical printing outcomes, I conducted printing tests and compared the resulting silicone samples.
 
 <p align="center">
-  <img src="images/Silicone_Printing_Before_After.png" alt="Silicone printing results before optimization on the left and after optimization on the right" width="800">
+  <img src="Images/Silicone_Printing_Before_After.png" alt="Silicone printing results before optimization on the left and after optimization on the right" width="800">
 </p>
 
 *Figure 2. Silicone samples before optimization (left) and after optimization (right).*
