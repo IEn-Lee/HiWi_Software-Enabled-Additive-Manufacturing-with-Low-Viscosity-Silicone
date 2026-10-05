@@ -115,12 +115,3 @@ The main outcomes were:
 
 **Core skills:** Python · G-code processing · Toolpath analysis · Residence-time modeling · Curing-aware process optimization · PID-based optimization · Silicone additive manufacturing · Experimental validation
 
-
---
-
-
-## Material and Process Context
-
-This project investigates extrusion-based additive manufacturing using low-viscosity, two-component RTV-2 silicone. Its focus is on how material residence time and thermal history influence the material state during printing, and how these effects can be considered when generating and optimizing toolpaths.
-
-The optimization approach links software-defined printing parameters to material behavior and evaluates the resulting changes through physical printing experiments.
