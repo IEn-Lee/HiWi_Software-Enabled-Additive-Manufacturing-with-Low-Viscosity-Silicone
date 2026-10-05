@@ -1,0 +1,485 @@
+--- "/mnt/data/\345\267\262\350\262\274\344\270\212\346\226\207\345\255\227 (1)(7).txt"	2026-08-11 08:05:41.945290051 +0000
++++ /mnt/data/residence_optimizer_free_segment_fifo_weighted_v1_1.py	2026-08-11 08:07:11.602459770 +0000
+@@ -2,8 +2,8 @@
+ """
+ Free segment-level FIFO residence-time optimizer for segmented G-code.
+ 
+-Version 1.0
+------------
++Version 1.1: corrected FIFO-weight residence model
++------------------------------------------------
+ This version removes control-block grouping and does NOT preserve the original
+ feed-rate distribution. Every adjustable G-code segment is an independent
+ control degree of freedom.
+@@ -50,14 +50,24 @@
+     scale trust window: every round may choose any physically legal segment
+     speed.
+ 
+-Important assumption
++FIFO residence model
+ --------------------
+-The linear timing model assumes G-code order, E/volume, V_nozzle, and the
+-baseline event interpretation stay fixed during one LP solve. TRUE validation
+-is recommended after large speed reconstruction.
++The optimizer reconstructs the TRUE FIFO volume dependencies instead of treating
++the scalar baseline `t_in` as a single event on the G-code time axis. For each
++FIFO piece i:
++
++    t_in(i) = sum_k w_ik * t_out(k)
++    tau(i)  = t_out(i) - t_in(i)
++
++The FIFO weights w_ik are determined by the fixed extrusion volumes and cycle
++order. Therefore the residence model remains linear while G-code order,
++E/volume, FIFO cycle assignment, and V_nozzle remain unchanged.
++
++TRUE validation is still recommended to verify consistency with the external
++FIFO builder.
+ 
+ Example:
+-python residence_optimizer_free_segment_lp_v1_0.py 
++python residence_optimizer_free_segment_fifo_weighted_v1_1.py 
+   --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" 
+   --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" 
+   --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_free_segment.gcode" 
+@@ -80,13 +90,14 @@
+   --vnozzle 574
+ 
+ CLI:
+-python residence_optimizer_free_segment_lp_v1_0.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_free_segment.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_free_segment_optimization" --target_mode direct --tau_min 770 --tau_ideal 800 --tau_max 840 --Fmin_extrusion 1 --Fmax_extrusion 5000 --enable_travel_opt --Fmin_travel 1 --Fmax_travel 10000 --enable_dwell_opt --max_relative_F_change 0 --max_relative_P_change 0 --stage1_only --true_validate --vnozzle 574
++python residence_optimizer_free_segment_fifo_weighted_v1_1.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_free_segment.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_free_segment_optimization" --target_mode direct --tau_min 770 --tau_ideal 800 --tau_max 840 --Fmin_extrusion 1 --Fmax_extrusion 5000 --enable_travel_opt --Fmin_travel 1 --Fmax_travel 10000 --enable_dwell_opt --max_relative_F_change 0 --max_relative_P_change 0 --stage1_only --true_validate --vnozzle 574
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import gc
++from collections import defaultdict, deque
+ import importlib
+ import json
+ import math
+@@ -124,6 +135,8 @@
+     row_i: int
+     seg_idx: int
+     cmd: str
++    cycle: int
++    cycle_local: int
+     d_mm: float
+     F: float
+     V_mm3: float
+@@ -190,8 +203,8 @@
+ def read_segments_csv(path: str) -> Tuple[List[Row], pd.DataFrame]:
+     df = pd.read_csv(path)
+     required = {
+-        "seg_idx", "cmd", "d_mm", "F_mm_per_min", "V_mm3", "t_s",
+-        "t_in", "t_out", "tau_s", "note",
++        "seg_idx", "cmd", "cycle", "cycle_local", "d_mm",
++        "F_mm_per_min", "V_mm3", "t_s", "t_in", "t_out", "tau_s", "note",
+     }
+     missing = sorted(required.difference(df.columns))
+     if missing:
+@@ -207,6 +220,8 @@
+                 row_i=int(row_i),
+                 seg_idx=int(rec["seg_idx"]),
+                 cmd=str(rec["cmd"]).strip().upper(),
++                cycle=int(finite_float(rec.get("cycle", -1), -1)),
++                cycle_local=int(finite_float(rec.get("cycle_local", -1), -1)),
+                 d_mm=finite_float(rec.get("d_mm", 0.0)),
+                 F=finite_float(rec.get("F_mm_per_min", 0.0)),
+                 V_mm3=finite_float(rec.get("V_mm3", 0.0)),
+@@ -245,6 +260,21 @@
+     return True
+ 
+ 
++def is_fifo_piece_row(row: Row) -> bool:
++    """Rows participating in the finite-volume FIFO cycle mapping.
++
++    Precondition pieces are intentionally included: they are not necessarily
++    scored product rows, but their t_out values are valid FIFO sources for the
++    following cycle in the TRUE builder.
++    """
++    return (
++        row.cmd == "G1"
++        and row.cycle >= 1
++        and math.isfinite(row.V_mm3)
++        and row.V_mm3 > EPS
++    )
++
++
+ def is_control_target_row(row: Row) -> bool:
+     if row.is_extrusion and not has_positive_extrusion_volume(row):
+         return False
+@@ -540,53 +570,301 @@
+     return float(sum(value * z[idx] for idx, value in weights.items()))
+ 
+ 
+-def build_residence_equations(rows: Sequence[Row], controls: Sequence[SegmentControl]) -> Tuple[List[ResidenceEquation], Dict[str, float]]:
++def _scale_representation(rep: EventRepresentation, factor: float) -> EventRepresentation:
++    return EventRepresentation(
++        fixed_offset=rep.fixed_offset * factor,
++        z_weights={
++            idx: value * factor
++            for idx, value in rep.z_weights.items()
++            if abs(value * factor) > 1e-14
++        },
++    )
++
++
++def _add_representations(parts: Sequence[EventRepresentation]) -> EventRepresentation:
++    fixed = 0.0
++    weights: Dict[int, float] = {}
++    for rep in parts:
++        fixed += rep.fixed_offset
++        for idx, value in rep.z_weights.items():
++            weights[idx] = weights.get(idx, 0.0) + value
++    weights = {idx: value for idx, value in weights.items() if abs(value) > 1e-14}
++    return EventRepresentation(fixed_offset=fixed, z_weights=weights)
++
++
++def _difference_representation(end: EventRepresentation, start: EventRepresentation) -> EventRepresentation:
++    fixed, weights = combine_event_difference(end, start)
++    return EventRepresentation(fixed_offset=fixed, z_weights=weights)
++
++
++def _weighted_representation(
++    sources: Sequence[Tuple[EventRepresentation, float]],
++) -> EventRepresentation:
++    return _add_representations([
++        _scale_representation(rep, weight) for rep, weight in sources
++    ])
++
++
++def _fifo_piece_cycles(rows: Sequence[Row]) -> Dict[int, List[int]]:
++    """Return FIFO-piece row indices grouped in TRUE-builder cycle order."""
++    cycles: Dict[int, List[int]] = defaultdict(list)
++    for i, row in enumerate(rows):
++        if is_fifo_piece_row(row):
++            cycles[row.cycle].append(i)
++    for cycle, indices in cycles.items():
++        indices.sort(key=lambda i: (rows[i].cycle_local, rows[i].seg_idx))
++    return dict(sorted(cycles.items()))
++
++
++def _find_fifo_time_origin(rows: Sequence[Row], cycles: Dict[int, List[int]]) -> Tuple[int, bool]:
++    fifo_indices = [i for indices in cycles.values() for i in indices]
++    if not fifo_indices:
++        raise ValueError("No FIFO piece rows with cycle>=1 and positive V_mm3 were found")
++
++    precondition = [i for i in fifo_indices if "precondition" in rows[i].note.lower()]
++    if precondition:
++        return min(precondition), True
++
++    # Compatibility fallback. In the provided TRUE builder, the precondition
++    # establishes the absolute FIFO timing origin. Without it, exact equivalence
++    # of non-extrusion timing is not guaranteed.
++    return min(fifo_indices), False
++
++
++def _build_fifo_tout_representations(
++    rows: Sequence[Row],
++    controls: Sequence[SegmentControl],
++    cycles: Dict[int, List[int]],
++) -> Tuple[Dict[int, EventRepresentation], Dict[str, object]]:
++    """Build linear t_out expressions at FIFO-piece row ends.
++
++    Each t_out is represented as elapsed G-code time from the FIFO timing origin
++    to the end of the corresponding FIFO piece. Adjustable rows contribute via
++    the independent cumulative-z variables; fixed rows remain fixed offsets.
++    """
+     pieces, total_time, total_fixed = build_timeline_pieces(rows, controls)
+     if not pieces:
+         raise ValueError("Timeline has no pieces")
+     piece_ends = np.asarray([p.end_t for p in pieces], dtype=float)
++
++    durations = np.asarray([row.t_s for row in rows], dtype=float)
++    starts = np.concatenate(([0.0], np.cumsum(durations)[:-1]))
++    ends = np.cumsum(durations)
++
++    origin_row, has_precondition = _find_fifo_time_origin(rows, cycles)
++    origin_time = float(starts[origin_row])
++    origin_repr = represent_event(
++        origin_time, pieces, piece_ends, total_time, total_fixed, len(controls)
++    )
++
++    tout: Dict[int, EventRepresentation] = {}
++    for indices in cycles.values():
++        for row_i in indices:
++            end_repr = represent_event(
++                float(ends[row_i]), pieces, piece_ends,
++                total_time, total_fixed, len(controls)
++            )
++            tout[row_i] = _difference_representation(end_repr, origin_repr)
++
++    return tout, {
++        "fifo_time_origin_row_i": int(origin_row),
++        "fifo_time_origin_seg_idx": int(rows[origin_row].seg_idx),
++        "fifo_time_origin_has_precondition": bool(has_precondition),
++    }
++
++
++def _build_fifo_tin_representations(
++    rows: Sequence[Row],
++    cycles: Dict[int, List[int]],
++    tout_repr: Dict[int, EventRepresentation],
++) -> Tuple[Dict[int, EventRepresentation], Dict[str, object]]:
++    """Reproduce TRUE FIFO volume backfill as fixed linear source weights.
++
++    For cycle >= 2, every current FIFO piece consumes material from the previous
++    cycle in FIFO order. The new t_in is the extracted-volume-weighted average
++    of the source pieces' *new* t_out expressions. This preserves the FIFO
++    material pairing without incorrectly treating baseline scalar t_in as a
++    physical time-axis event.
++    """
++    tin: Dict[int, EventRepresentation] = {}
++    fallback_volume_total = 0.0
++    source_link_count = 0
++    max_sources_per_piece = 0
++
++    cycle_ids = sorted(cycles)
++    if not cycle_ids:
++        return tin, {
++            "fifo_source_link_count": 0,
++            "fifo_fallback_volume_mm3": 0.0,
++            "fifo_max_sources_per_piece": 0,
++        }
++
++    # Match the supplied TRUE builder: the first FIFO cycle has zero t_in span.
++    first_cycle = cycle_ids[0]
++    for row_i in cycles[first_cycle]:
++        tin[row_i] = EventRepresentation(fixed_offset=0.0, z_weights={})
++
++    for cycle in cycle_ids[1:]:
++        prev_indices = cycles.get(cycle - 1, [])
++        curr_indices = cycles[cycle]
++        if not prev_indices:
++            raise ValueError(
++                f"FIFO cycle {cycle} has no previous cycle {cycle - 1}; "
++                "cannot reconstruct TRUE FIFO source mapping"
++            )
++
++        fifo = deque(
++            {"row_i": src_i, "remaining": float(rows[src_i].V_mm3)}
++            for src_i in prev_indices
++        )
++        fallback_i = prev_indices[-1]
++
++        for dst_i in curr_indices:
++            total_need = float(rows[dst_i].V_mm3)
++            need = total_need
++            if total_need <= EPS:
++                tin[dst_i] = tout_repr[fallback_i]
++                continue
++
++            weighted_sources: List[Tuple[EventRepresentation, float]] = []
++            used_sources = 0
++            while need > EPS and fifo:
++                head = fifo[0]
++                take = min(float(head["remaining"]), need)
++                if take > EPS:
++                    weighted_sources.append(
++                        (tout_repr[int(head["row_i"])], take / total_need)
++                    )
++                    used_sources += 1
++                    source_link_count += 1
++                head["remaining"] = float(head["remaining"]) - take
++                need -= take
++                if float(head["remaining"]) <= EPS:
++                    fifo.popleft()
++
++            if need > EPS:
++                weighted_sources.append((tout_repr[fallback_i], need / total_need))
++                fallback_volume_total += need
++                source_link_count += 1
++                used_sources += 1
++
++            max_sources_per_piece = max(max_sources_per_piece, used_sources)
++            tin[dst_i] = _weighted_representation(weighted_sources)
++
++    return tin, {
++        "fifo_source_link_count": int(source_link_count),
++        "fifo_fallback_volume_mm3": float(fallback_volume_total),
++        "fifo_max_sources_per_piece": int(max_sources_per_piece),
++    }
++
++
++def build_residence_equations(
++    rows: Sequence[Row], controls: Sequence[SegmentControl]
++) -> Tuple[List[ResidenceEquation], Dict[str, object]]:
++    """Build residence equations from TRUE FIFO volume dependencies.
++
++    Correct linear model:
++        t_out(i) = linear function of independent segment durations
++        t_in(i)  = sum_k w_ik * t_out(k)
++        tau(i)   = t_out(i) - t_in(i)
++
++    The FIFO weights w_ik depend only on fixed extrusion volumes and FIFO order,
++    so they remain constant while the optimizer changes timing only.
++    """
++    cycles = _fifo_piece_cycles(rows)
++    if not cycles:
++        raise ValueError("No FIFO cycle data could be reconstructed from the CSV")
++
++    tout_repr, timing_diag = _build_fifo_tout_representations(rows, controls, cycles)
++    tin_repr, fifo_diag = _build_fifo_tin_representations(rows, cycles, tout_repr)
+     z0 = baseline_z(controls)
+ 
+     equations: List[ResidenceEquation] = []
+     skipped = 0
+-    residuals: List[float] = []
++    tau_residuals: List[float] = []
++    tin_residuals: List[float] = []
++    tout_residuals: List[float] = []
++
++    first_cycle_id = min(cycles)
+     for row_i, row in enumerate(rows):
+         if not is_scored_extrusion_row(row):
+             continue
+-        if not (math.isfinite(row.t_in) and math.isfinite(row.t_out) and math.isfinite(row.tau_s)):
++        if (
++            row.cycle == first_cycle_id
++            and math.isfinite(row.t_in)
++            and abs(row.t_in) > 1e-6
++        ):
++            raise ValueError(
++                "A scored FIFO row in the first cycle has non-zero t_in. "
++                "The supplied TRUE builder uses zero cycle-1 injection span; "
++                "this dataset appears to use a different cycle-1 initialization."
++            )
++        if row_i not in tout_repr or row_i not in tin_repr:
+             skipped += 1
+             continue
+-        if row.t_out + 1e-9 < row.t_in:
++        if not math.isfinite(row.tau_s):
+             skipped += 1
+             continue
+ 
+-        start_repr = represent_event(row.t_in, pieces, piece_ends, total_time, total_fixed, len(controls))
+-        end_repr = represent_event(row.t_out, pieces, piece_ends, total_time, total_fixed, len(controls))
+-        fixed_part, weights = combine_event_difference(end_repr, start_repr)
+-        pred0 = fixed_part + dot_weights(weights, z0)
+-        residual = row.tau_s - pred0
+-        residuals.append(residual)
++        tau_repr = _difference_representation(tout_repr[row_i], tin_repr[row_i])
++        pred_tau0 = tau_repr.fixed_offset + dot_weights(tau_repr.z_weights, z0)
++        residual = row.tau_s - pred_tau0
++        tau_residuals.append(residual)
++
++        if math.isfinite(row.t_out):
++            pred_tout0 = (
++                tout_repr[row_i].fixed_offset
++                + dot_weights(tout_repr[row_i].z_weights, z0)
++            )
++            tout_residuals.append(row.t_out - pred_tout0)
++        if math.isfinite(row.t_in):
++            pred_tin0 = (
++                tin_repr[row_i].fixed_offset
++                + dot_weights(tin_repr[row_i].z_weights, z0)
++            )
++            tin_residuals.append(row.t_in - pred_tin0)
++
++        # Retain only the tiny baseline CSV/numerical residual as calibration.
++        # All timing sensitivity comes from the reconstructed FIFO dependencies.
+         equations.append(ResidenceEquation(
+             row_i=row_i,
+             seg_idx=row.seg_idx,
+             baseline_tau=row.tau_s,
+-            constant=fixed_part + residual,
+-            z_weights=weights,
++            constant=tau_repr.fixed_offset + residual,
++            z_weights=tau_repr.z_weights,
+         ))
+ 
+     if not equations:
+-        raise ValueError("No valid scored extrusion rows with finite t_in/t_out/tau_s")
+-    diagnostics = {
++        raise ValueError(
++            "No valid scored extrusion rows could be modeled with FIFO volume weights"
++        )
++
++    def abs_max(values: Sequence[float]) -> float:
++        return float(max(abs(v) for v in values)) if values else 0.0
++
++    def rmse(values: Sequence[float]) -> float:
++        return float(math.sqrt(np.mean(np.square(values)))) if values else 0.0
++
++    _, total_time, total_fixed = build_timeline_pieces(rows, controls)
++    diagnostics: Dict[str, object] = {
++        "model_type": "fifo_volume_weighted_tout_dependencies",
+         "equation_count": len(equations),
+-        "skipped_scored_rows": skipped,
+-        "baseline_residual_abs_max": float(max(abs(v) for v in residuals)) if residuals else 0.0,
+-        "baseline_residual_rmse": float(math.sqrt(np.mean(np.square(residuals)))) if residuals else 0.0,
+-        "timeline_total_s": total_time,
+-        "timeline_fixed_s": total_fixed,
++        "skipped_scored_rows": int(skipped),
++        "fifo_cycle_count": int(len(cycles)),
++        "fifo_piece_count": int(sum(len(v) for v in cycles.values())),
++        "baseline_residual_abs_max": abs_max(tau_residuals),
++        "baseline_residual_rmse": rmse(tau_residuals),
++        "baseline_tin_residual_abs_max": abs_max(tin_residuals),
++        "baseline_tin_residual_rmse": rmse(tin_residuals),
++        "baseline_tout_residual_abs_max": abs_max(tout_residuals),
++        "baseline_tout_residual_rmse": rmse(tout_residuals),
++        "timeline_total_s": float(total_time),
++        "timeline_fixed_s": float(total_fixed),
++        **timing_diag,
++        **fifo_diag,
+     }
+     return equations, diagnostics
+ 
+-
+ def evaluate_equations(equations: Sequence[ResidenceEquation], z: np.ndarray) -> np.ndarray:
+     out = np.empty(len(equations), dtype=float)
+     for i, eq in enumerate(equations):
+@@ -1098,7 +1376,23 @@
+ 
+     print(f"  Loaded {len(rows):,} rows")
+     print(f"  Independent adjustable segments: {len(controls):,}")
+-    print(f"  Residence equations: {len(equations):,}")
++    print(f"  Residence equations: {len(equations):,} (FIFO volume-weighted model)")
++    print(
++        "  FIFO baseline check: "
++        f"tau_abs_max={float(model_diag['baseline_residual_abs_max']):.3e}s, "
++        f"tin_abs_max={float(model_diag['baseline_tin_residual_abs_max']):.3e}s, "
++        f"tout_abs_max={float(model_diag['baseline_tout_residual_abs_max']):.3e}s"
++    )
++    if not bool(model_diag.get("fifo_time_origin_has_precondition", False)):
++        print(
++            "  Warning: no precondition FIFO piece was found; exact travel/dwell "
++            "timing equivalence with the supplied TRUE builder is not guaranteed."
++        )
++    if float(model_diag.get("fifo_fallback_volume_mm3", 0.0)) > 1e-9:
++        print(
++            "  Warning: previous-cycle FIFO source volume was insufficient; "
++            f"fallback volume={float(model_diag['fifo_fallback_volume_mm3']):.6g} mm^3"
++        )
+     print(
+         f"  TRUE baseline: within={baseline_metrics['within_percent']:.3f}% "
+         f"violations={baseline_metrics['violation_count']:,} vmax={baseline_metrics['vmax_s']:.6f}s"
+@@ -1427,6 +1721,7 @@
+         print("Free independent-segment residence-time LP optimizer")
+         print("Original relative speed distribution: NOT preserved")
+         print("Grouping: disabled; one independent control per adjustable segment")
++        print("FIFO model: volume-weighted source t_out dependencies (corrected model)")
+         print(f"Target tau window: [{tau_lo:.6f}, {tau_hi:.6f}] s; ideal={tau_star:.6f} s")
+         print(
+             "Feed-rate bounds: "
+@@ -1553,6 +1848,7 @@
+                 "control_grouping": False,
+                 "conceptual_decision_variable": "segment_execution_duration",
+                 "sparse_implementation": "cumulative_z_with_independent_segment_differences",
++                "residence_model": "fifo_volume_weighted_tout_dependencies",
+                 "true_fifo_relinearization": run_true_each_round,
+                 "iterations_requested": args.iterations,
+                 "attempts_completed": len(history),
+@@ -1573,8 +1869,9 @@
+                 "minimal_worst_violation_s": first_stage1_vmax,
+                 "predicted_full_window_feasible": first_predicted_feasible,
+                 "interpretation": (
+-                    "If true, the fixed-event linear model found a legal independent-segment timing profile "
+-                    "placing every scored residence row inside the target window. TRUE FIFO validation is separate."
++                    "If true, the FIFO-volume-weighted linear model found a legal independent-segment timing "
++                    "profile placing every scored residence row inside the target window. TRUE FIFO validation "
++                    "is still used as an external consistency check."
+                 ),
+             },
+             "initial_metrics": initial_metrics,

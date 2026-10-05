@@ -1,38 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-rebuild_from_modified_csv_fifo.py
----------------------------------
-Rebuild FIFO timing (t_in/t_out/tau_s) and regenerate G-code values
-based on a user-modified CSV (same schema as segment_fifo_builder_v6.1 output).
+"""Rebuild FIFO timing and G-code from a user-modified CSV file.
 
-Inputs:
-  1) modified CSV (seg_idx-aligned, same columns)
-  2) reference old segmented G-code (used as geometry/text template)
+The script reads a modified segment CSV and a reference segmented G-code file.
+It recalculates segment durations, FIFO input times, output times, and residence
+times, then generates an updated CSV and G-code file.
 
-Outputs:
-  1) new CSV (same columns) with recomputed t_in/t_out/tau_s
-  2) new G-code updated according to the modified CSV (by seg_idx mapping)
-
-Key behavior:
-- FIFO timing model matches your v6.1 "Phase E" logic:
-  * time origin starts at first row that is "optimizable" (note contains 'optimizable')
-  * inj_end_time accumulates t_s of NON-PIECE rows after time origin, and updates whenever
-    a NON-PIECE row is optimizable
-  * For cycle 1: t_in is a linear ramp over inj_end_time: i*(inj_end_time/N)
-  * For cycles >=2: t_in is FIFO backfilled from previous cycle's absolute t_out
-- non-extrusion delays are taken from the CSV row order:
-  * piece rows: contribute to extrusion offsets (t_s)
-  * non-piece rows: contribute to delay accumulator (t_s)
-- G-code regeneration:
-  * lines are mapped by seg_idx (must exist in the gcode comment)
-  * for extrusion pieces (note contains 'extrusion' or cmd==G1 with cycle>=1):
-      - F is updated from CSV F_mm_per_min
-      - E is optionally updated from CSV V_mm3 (via --update_e)
-  * for pre_infill rows (note contains 'pre_infill'):
-      - F and E can also be updated similarly
-  * other lines are kept as-is (except still keep original seg_idx, no reindex)
+G-code lines are matched to CSV rows using their ``seg_idx`` identifiers.
+Feed-rate values can be updated from the CSV, and extrusion values can
+optionally be regenerated from the modified volume values.
 
 CLI example:
 python rebuild_from_modified_csv_fifo.py \
@@ -56,6 +33,16 @@ from typing import Dict, List, Tuple, Optional
 # ---------------------------- Formatting ----------------------------
 
 def fmt_fixed(x: float, nd: int = 5) -> str:
+    """Format a numeric value without unnecessary trailing zeros.
+
+    Args:
+        x: Value to format.
+        nd: Maximum number of decimal places. Defaults to 5.
+
+    Returns:
+        The formatted numeric string. Returns an empty string if ``x`` is
+        ``None``. Non-numeric values are converted directly to strings.
+    """
     if x is None:
         return ""
     try:
@@ -67,15 +54,40 @@ def fmt_fixed(x: float, nd: int = 5) -> str:
 
 
 def area_circle(d: float) -> float:
+    """Calculate the area of a circle from its diameter.
+
+    Args:
+        d: Circle diameter.
+
+    Returns:
+        The circle area.
+    """
     return math.pi * (0.5 * d) ** 2
 
 
 # ---------------------------- FIFO backfill ----------------------------
 
-def fifo_backfill_times(pieces_in_cycle: List[dict], prev_out_log: Optional[deque], fallback_time: float) -> List[float]:
-    """
-    Volume-weighted FIFO mapping:
-    current piece's t_in = weighted average of previous cycle parcels' t_out
+def fifo_backfill_times(
+    pieces_in_cycle: List[dict],
+    prev_out_log: Optional[deque],
+    fallback_time: float,
+) -> List[float]:
+    """Calculate FIFO input times from previous-cycle output parcels.
+
+    Each current-cycle piece receives a volume-weighted input time based
+    on the output times of material parcels from the previous cycle. If
+    insufficient parcel volume is available, ``fallback_time`` is used
+    for the remaining volume.
+
+    Args:
+        pieces_in_cycle: Current-cycle pieces containing ``V`` values.
+        prev_out_log: Previous-cycle parcels containing ``V`` and
+            ``t_out`` values. May be ``None``.
+        fallback_time: Time assigned to unmatched material volume.
+
+    Returns:
+        A list of volume-weighted input times corresponding to the
+        current-cycle pieces.
     """
     fifo = deque(prev_out_log) if prev_out_log is not None else deque()
     result = []
@@ -115,6 +127,16 @@ CSV_HEADER = [
 
 
 def _to_float(s: str, default: float = 0.0) -> float:
+    """Convert a value to a floating-point number.
+
+    Args:
+        s: Value to convert.
+        default: Value returned when conversion fails. Defaults to 0.0.
+
+    Returns:
+        The converted floating-point value, or ``default`` if the input
+        is empty or invalid.
+    """
     try:
         if s is None:
             return default
@@ -127,6 +149,18 @@ def _to_float(s: str, default: float = 0.0) -> float:
 
 
 def _to_int(s: str, default: int = 0) -> int:
+    """Convert a value to an integer.
+
+    Floating-point strings are accepted and converted to integers.
+
+    Args:
+        s: Value to convert.
+        default: Value returned when conversion fails. Defaults to 0.
+
+    Returns:
+        The converted integer, or ``default`` if the input is empty
+        or invalid.
+    """
     try:
         if s is None:
             return default
@@ -139,6 +173,20 @@ def _to_int(s: str, default: int = 0) -> int:
 
 
 def read_modified_csv(csv_path: str) -> List[dict]:
+    """Read a modified segment CSV file.
+
+    Extra columns beyond the standard FIFO schema are preserved.
+
+    Args:
+        csv_path: Path to the input CSV file.
+
+    Returns:
+        A list of dictionaries containing the CSV rows.
+
+    Raises:
+        OSError: If the CSV file cannot be opened.
+        csv.Error: If the CSV content cannot be parsed.
+    """
     rows = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         r = csv.DictReader(f)
@@ -151,15 +199,24 @@ def read_modified_csv(csv_path: str) -> List[dict]:
 # ---------------------------- Identify row types ----------------------------
 
 def is_optimizable_row(row: dict) -> bool:
+    """Return whether a CSV row contains the ``optimizable`` marker."""
     note = (row.get("note") or "").lower()
     return "optimizable" in note
 
 
 def is_piece_row(row: dict) -> bool:
-    """
-    We treat rows as "piece" if they represent segmented extrusion pieces:
-    - cmd == G1 AND cycle >= 1 AND V_mm3 > 0
-    - or note contains 'extrusion'
+    """Determine whether a CSV row represents an extrusion piece.
+
+    A row is considered an extrusion piece when its note contains
+    ``extrusion``, or when it is a G1 command with a valid cycle number
+    and positive extrusion volume.
+
+    Args:
+        row: CSV row to evaluate.
+
+    Returns:
+        ``True`` if the row represents an extrusion piece; otherwise,
+        ``False``.
     """
     cmd = (row.get("cmd") or "").strip().upper()
     cyc = _to_int(row.get("cycle"), 0)
@@ -174,18 +231,38 @@ def is_piece_row(row: dict) -> bool:
 
 
 def is_pre_infill_row(row: dict) -> bool:
+    """Return whether a CSV row contains the ``pre_infill`` marker."""
     note = (row.get("note") or "").lower()
     return "pre_infill" in note
 
 
 # ---------------------------- Timing rebuild ----------------------------
 
-def recompute_piece_ts_from_F(rows, *, e_mode: str, d_filament: float) -> List[dict]:
-    """
-    Recompute t_s for piece/pre_infill rows based on NEW F:
-      - if d_mm > 0:  t_s = 60 * d_mm / F
-      - else (E-only): t_s = 60 * |E| / F, where E derived from V_mm3 and e_mode
-    Returns a NEW list of rows (dict-copied) with updated t_s (string).
+def recompute_piece_ts_from_F(
+    rows,
+    *,
+    e_mode: str,
+    d_filament: float,
+) -> List[dict]:
+    """Recompute command durations using the modified feed rates.
+
+    For rows with XY movement, duration is calculated from travel distance
+    and feed rate. For E-only rows, the E-axis movement is derived from the
+    extrusion volume and E mode.
+
+    The input rows are copied before modification.
+
+    Args:
+        rows: CSV rows containing motion and extrusion information.
+        e_mode: Interpretation of E values. Supported modes are
+            ``"filament"`` and ``"mm3"``.
+        d_filament: Filament diameter in millimetres.
+
+    Returns:
+        A new list of CSV rows with updated ``t_s`` values.
+
+    Raises:
+        ValueError: If ``e_mode`` is unsupported.
     """
     out = [dict(r) for r in rows]
 
@@ -216,13 +293,31 @@ def recompute_piece_ts_from_F(rows, *, e_mode: str, d_filament: float) -> List[d
 
     return out
 
-def rebuild_fifo_timing_from_csv(rows: List[dict]) -> Tuple[List[dict], float]:
-    """
-    Returns: (updated_rows, inj_end_time)
-    - updates t_in, t_out, tau_s fields for piece rows
-    - leaves other rows unchanged (t_in/t_out/tau_s blank)
-    """
+def rebuild_fifo_timing_from_csv(
+    rows: List[dict],
+) -> Tuple[List[dict], float]:
+    """Recalculate FIFO timing from ordered CSV rows.
 
+    The function identifies extrusion pieces, groups them by FIFO cycle,
+    accounts for non-extrusion delays, and recalculates ``t_in``,
+    ``t_out``, and ``tau_s``.
+
+    Non-piece rows remain unchanged, and their FIFO timing fields are
+    not populated.
+
+    Args:
+        rows: Ordered CSV rows containing segment, cycle, volume, and
+            duration information.
+
+    Returns:
+        A tuple containing:
+
+        - A new list of rows with recalculated FIFO timing fields.
+        - The calculated injection end time in seconds.
+
+    Raises:
+        RuntimeError: If no extrusion-piece rows are detected.
+    """
     # Build list of piece ordinals and their non-extrusion delay before each piece
     nonextr_delay_up_to_piece: List[float] = []
     piece_ord_to_row_index: List[int] = []
@@ -282,6 +377,15 @@ def rebuild_fifo_timing_from_csv(rows: List[dict]) -> Tuple[List[dict], float]:
         cycles.append(cyc)
 
     def cum_inclusive(plist: List[dict]) -> List[float]:
+        """Calculate inclusive cumulative durations.
+
+        Args:
+            plist: Pieces containing ``t_s`` duration values.
+
+        Returns:
+            A list in which each value includes the duration of the
+            corresponding current piece.
+        """
         out = []
         acc = 0.0
         for p in plist:
@@ -375,6 +479,15 @@ def rebuild_fifo_timing_from_csv(rows: List[dict]) -> Tuple[List[dict], float]:
 SEGIDX_RE = re.compile(r"(?:^|[;\s])seg_idx\s*=\s*(\d+)\s*$", re.IGNORECASE)
 
 def extract_seg_idx(line: str) -> Optional[int]:
+    """Extract the trailing segment index from a G-code line.
+
+    Args:
+        line: G-code line that may contain a trailing ``seg_idx`` token.
+
+    Returns:
+        The segment index as an integer, or ``None`` if no valid token
+        is found.
+    """
     s = line.rstrip("\n")
     m = SEGIDX_RE.search(s)
     if not m:
@@ -382,16 +495,39 @@ def extract_seg_idx(line: str) -> Optional[int]:
     return int(m.group(1))
 
 def strip_trailing_seg_idx(line: str) -> str:
-    """Remove the trailing 'seg_idx=N' token but keep other content unchanged."""
+    """Remove the trailing segment index from a G-code line.
+
+    Args:
+        line: G-code line containing an optional trailing ``seg_idx``
+            token.
+
+    Returns:
+        The line without its trailing segment index. All other content
+        is preserved.
+    """
     s = line.rstrip("\n")
     # remove only the trailing seg_idx=... and possible spaces before it
     s2 = re.sub(r"\s*seg_idx\s*=\s*\d+\s*$", "", s, flags=re.IGNORECASE)
     return s2
 
-def replace_token_value(line: str, letter: str, new_value_str: str) -> str:
-    """
-    Replace a token like 'F123.45' or 'E0.010' with new value, preserving other tokens.
-    If token doesn't exist, append it before the first ';' comment (or at end).
+def replace_token_value(
+    line: str,
+    letter: str,
+    new_value_str: str,
+) -> str:
+    """Replace or append a numeric G-code token.
+
+    If the requested token exists in the executable portion of the line,
+    its first occurrence is replaced. Otherwise, the token is appended
+    before the semicolon comment.
+
+    Args:
+        line: Complete G-code line to update.
+        letter: Token letter, such as ``"F"`` or ``"E"``.
+        new_value_str: Replacement numeric value formatted as a string.
+
+    Returns:
+        The updated G-code line without changing the existing comment.
     """
     s = line.rstrip("\n")
     # split code / comment
@@ -412,7 +548,26 @@ def replace_token_value(line: str, letter: str, new_value_str: str) -> str:
         return code2.rstrip() + " ;" + cmt
     return code2.rstrip()
 
-def compute_E_from_V(V_mm3: float, e_mode: str, d_filament: float) -> float:
+def compute_E_from_V(
+    V_mm3: float,
+    e_mode: str,
+    d_filament: float,
+) -> float:
+    """Convert extrusion volume to an E-axis value.
+
+    Args:
+        V_mm3: Extrusion volume in cubic millimetres.
+        e_mode: Interpretation of E values. Supported modes are
+            ``"filament"`` and ``"mm3"``.
+        d_filament: Filament diameter in millimetres.
+
+    Returns:
+        The corresponding E-axis value. Returns zero for negligible
+        volume or invalid filament area.
+
+    Raises:
+        ValueError: If ``e_mode`` is not ``"filament"`` or ``"mm3"``.
+    """
     if abs(V_mm3) < 1e-12:
         return 0.0
     if e_mode == "mm3":
@@ -433,8 +588,28 @@ def update_gcode_from_csv(
     e_mode: str,
     d_filament: float,
 ) -> Tuple[int, int]:
-    """
-    Returns (updated_lines, total_lines_written)
+    """Update G-code commands using values from rebuilt CSV rows.
+
+    G-code lines are matched to CSV rows by ``seg_idx``. Feed rates are
+    updated for extrusion and pre-infill commands. E values are updated
+    only when ``update_e`` is enabled.
+
+    Args:
+        gcode_ref_path: Path to the reference segmented G-code file.
+        gcode_out_path: Path for the updated G-code output.
+        rows_by_segidx: Mapping from segment indices to rebuilt CSV rows.
+        update_e: Whether to regenerate E values from CSV volumes.
+        e_mode: Interpretation of E values. Supported modes are
+            ``"filament"`` and ``"mm3"``.
+        d_filament: Filament diameter in millimetres.
+
+    Returns:
+        A tuple containing the number of updated lines and the total
+        number of lines written.
+
+    Raises:
+        OSError: If the input or output G-code file cannot be opened.
+        ValueError: If E-value conversion uses an unsupported mode.
     """
     updated = 0
     total = 0
@@ -484,19 +659,27 @@ def update_gcode_from_csv(
 
     return updated, total
 
-def build_segidx_motion_map_from_gcode(gcode_path: str) -> dict:
-    """
-    Parse reference segmented gcode and build:
-      seg_idx -> {
-        "has_xyz": bool,   # line contains any X/Y/Z token
-        "d_xyz": float,    # 3D distance between consecutive positions (mm)
-        "E": float or None # E value on that line (relative, as printed in segmented gcode)
-      }
+def build_segidx_motion_map_from_gcode(
+    gcode_path: str,
+) -> dict:
+    """Build a motion-information mapping from segmented G-code.
 
-    Assumptions:
-      - G1 SEG lines contain X/Y/Z (usually) and E and F
-      - seg_idx=N exists at end of each line
-      - We compute distance by tracking last known X/Y/Z state across file.
+    The function tracks modal XYZ positions and calculates the
+    three-dimensional movement distance of each G0 or G1 line that has
+    a segment index.
+
+    Args:
+        gcode_path: Path to the reference segmented G-code file.
+
+    Returns:
+        A mapping from each segment index to a dictionary containing:
+
+        - ``has_xyz``: Whether the line contains an XYZ token.
+        - ``d_xyz``: Three-dimensional movement distance in millimetres.
+        - ``E``: E value on the line, or ``None`` if absent.
+
+    Raises:
+        OSError: If the G-code file cannot be opened.
     """
     seg_map = {}
 
@@ -552,13 +735,35 @@ def build_segidx_motion_map_from_gcode(gcode_path: str) -> dict:
 
     return seg_map
 
-def recompute_piece_ts_from_F_using_gcode(rows, seg_motion_map, *, e_mode: str, d_filament: float):
-    """
-    Recompute t_s for piece/pre_infill rows using:
-      - if G-code line has any X/Y/Z token:  t_s = 60*d_xyz/F
-      - else (pure E-only):                 t_s = 60*|E|/F  (E derived from CSV V_mm3 + e_mode)
+def recompute_piece_ts_from_F_using_gcode(
+    rows,
+    seg_motion_map,
+    *,
+    e_mode: str,
+    d_filament: float,
+):
+    """Recompute command durations using G-code motion information.
 
-    seg_motion_map comes from build_segidx_motion_map_from_gcode().
+    If a matched G-code line contains an XYZ token, duration is calculated
+    from its three-dimensional travel distance. Otherwise, the row is
+    treated as an E-only command and its duration is calculated from the
+    extrusion volume.
+
+    The input rows are copied before modification.
+
+    Args:
+        rows: CSV rows containing segment and feed-rate information.
+        seg_motion_map: Motion mapping produced by
+            ``build_segidx_motion_map_from_gcode``.
+        e_mode: Interpretation of E values. Supported modes are
+            ``"filament"`` and ``"mm3"``.
+        d_filament: Filament diameter in millimetres.
+
+    Returns:
+        A new list of CSV rows with updated ``t_s`` values.
+
+    Raises:
+        ValueError: If E-value conversion uses an unsupported mode.
     """
     out = [dict(r) for r in rows]
 
@@ -598,6 +803,24 @@ def recompute_piece_ts_from_F_using_gcode(rows, seg_motion_map, *, e_mode: str, 
 # ---------------------------- Main ----------------------------
 
 def main():
+    """Run the modified-CSV FIFO rebuild workflow.
+
+    The command-line interface reads the modified CSV and reference
+    G-code, validates segment indices, recalculates command durations
+    and FIFO timing, writes the rebuilt CSV, and generates the updated
+    G-code file.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If required command-line arguments are missing or
+            invalid.
+        RuntimeError: If the CSV contains no segment indices, duplicate
+            segment indices, or no detectable extrusion pieces.
+        OSError: If an input or output file cannot be accessed.
+        ValueError: If an unsupported E mode is used during conversion.
+    """
     ap = argparse.ArgumentParser(
         description="Rebuild FIFO timing from a modified v6.1-style CSV and regenerate a new G-code using an old segmented gcode as template."
     )

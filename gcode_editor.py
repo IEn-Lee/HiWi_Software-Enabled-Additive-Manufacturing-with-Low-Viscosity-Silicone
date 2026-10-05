@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-One-shot G-code parameter editor
+"""Edit one parameter in selected G-code commands.
 
-Features:
-- Only accepts .gcode input file
-- Edit only lines whose "G-code prefix" matches (e.g., G0, G1, G4)
-  - Supports multiple prefixes in one run: e.g. "G0 G1 G4" or "G0,G1,G4" or "G0/G1/G4"
-- Edit only one parameter type per run: X/Y/Z/E/F...
-- Mode:
-  - set   : replace value with given number
-  - inc   : add delta to existing value (can be negative)
-  - scale : multiply existing value by a factor (e.g., 1.1, 0.95)
-- Preserve original line formatting (spacing/order/comments). Only the number token is replaced.
-- Preserve original decimal precision per line.
+This script modifies a specified parameter, such as X, Y, Z, E, or F, only
+within G-code lines whose command prefixes match the user-defined selection.
+
+Multiple command prefixes can be processed in one run. For example, the user
+may select G0, G1, and G4 simultaneously. The original spacing, parameter
+order, comments, line endings, and decimal precision are preserved whenever
+possible.
+
+Supported modification modes are:
+
+* ``set``: Replace the existing parameter value.
+* ``inc``: Add a specified value to the existing parameter value.
+* ``scale``: Multiply the existing parameter value by a specified factor.
+
+Only existing parameter tokens are modified. Missing parameters are not added.
 """
 
 import os
@@ -24,7 +27,19 @@ from typing import List, Tuple
 
 
 def _count_decimals(num_str: str) -> int:
-    """Return number of digits after decimal point in a numeric literal."""
+    """Count the decimal places in a numeric literal.
+
+    Scientific notation does not provide an unambiguous fixed decimal
+    precision, so six decimal places are used as a fallback.
+
+    Args:
+        num_str: Numeric literal to inspect, such as ``"12.340"`` or
+            ``"1.2e-3"``.
+
+    Returns:
+        The number of digits after the decimal point. Returns 6 when the
+        input uses scientific notation.
+    """
     s = num_str.strip()
     if "e" in s.lower():
         # scientific notation: no clear decimal places; fallback to 6
@@ -35,7 +50,18 @@ def _count_decimals(num_str: str) -> int:
 
 
 def _format_with_decimals(value: Decimal, decimals: int) -> str:
-    """Format Decimal with fixed decimals, avoiding scientific notation."""
+    """Format a decimal value using a fixed number of decimal places.
+
+    The value is rounded using ``ROUND_HALF_UP`` and formatted without
+    scientific notation.
+
+    Args:
+        value: Decimal value to format.
+        decimals: Number of digits to retain after the decimal point.
+
+    Returns:
+        The formatted numeric string.
+    """
     if decimals <= 0:
         q = Decimal("1")
         vq = value.quantize(q, rounding=ROUND_HALF_UP)
@@ -46,37 +72,72 @@ def _format_with_decimals(value: Decimal, decimals: int) -> str:
 
 
 def _is_gcode_file(path: str) -> bool:
+    """Check whether a path points to an existing G-code file.
+
+    Args:
+        path: Path to the file to check.
+
+    Returns:
+        ``True`` if the path is an existing file with a ``.gcode``
+        extension; otherwise, ``False``.
+    """
     return os.path.isfile(path) and path.lower().endswith(".gcode")
 
 
 def _parse_prefixes(prefix_input: str) -> List[str]:
-    """
-    Parse multi-prefix input like:
-      "G0 G1 G4" or "G0,G1,G4" or "G0/G1/G4"
+    """Parse one or more G-code command prefixes.
+
+    Prefixes may be separated by commas, whitespace, forward slashes, or
+    any combination of these delimiters. Returned prefixes are converted
+    to uppercase.
+
+    Examples:
+        ``"G0 G1 G4"``, ``"G0,G1,G4"``, and ``"G0/G1/G4"`` all produce
+        ``["G0", "G1", "G4"]``.
+
+    Args:
+        prefix_input: User-provided string containing one or more G-code
+            command prefixes.
+
+    Returns:
+        A list of normalized uppercase prefixes.
+
+    Raises:
+        ValueError: If no valid prefix is provided.
     """
     parts = re.split(r"[,\s/]+", prefix_input.strip())
     prefixes = [p.strip().upper() for p in parts if p.strip()]
     if not prefixes:
-        raise ValueError("prefix 不能為空，請至少輸入一個，例如 G1 或 G0,G1。")
+        raise ValueError(
+            "The prefix cannot be empty. Enter at least one prefix, "
+            "such as G1 or G0,G1."
+        )
     return prefixes
 
 
 def _compile_prefix_regex(prefixes: List[str]) -> re.Pattern:
-    """
-    Match any given prefix token at start of G-code (ignoring leading whitespace),
-    allowing line numbers like 'N123 ' before it.
+    """Compile a regular expression for selected G-code commands.
 
-    Examples matched:
-      "G1 X10"
-      "  G1 X10"
-      "N123 G1 X10"
-    Not matched:
-      ";G1 X10" (commented)
-      "M104 ..."
+    The resulting expression matches a command at the beginning of a
+    G-code line while allowing leading whitespace and an optional line
+    number such as ``N123``.
+
+    For example, a prefix of ``G1`` matches ``"G1 X10"``,
+    ``"  G1 X10"``, and ``"N123 G1 X10"``, but does not match a
+    commented line such as ``";G1 X10"``.
+
+    Args:
+        prefixes: G-code command prefixes to match.
+
+    Returns:
+        A compiled case-insensitive regular expression.
+
+    Raises:
+        ValueError: If the prefix list contains no valid entries.
     """
     clean = [re.escape(p.strip().upper()) for p in prefixes if p.strip()]
     if not clean:
-        raise ValueError("prefix 清單無效。")
+        raise ValueError("The prefix list in invalid")
 
     # (?=\s|$) ensures the prefix ends as a token
     alt = "|".join(clean)
@@ -84,15 +145,27 @@ def _compile_prefix_regex(prefixes: List[str]) -> re.Pattern:
 
 
 def _compile_param_regex(param: str) -> re.Pattern:
-    """
-    Match the parameter token like X12.34, allowing +/- sign and decimals.
-    We capture:
-      group(1): the letter (e.g., X)
-      group(2): the numeric literal
+    """Compile a regular expression for a G-code parameter token.
+
+    The expression matches a parameter letter followed by a signed or
+    unsigned numeric value. Decimal and scientific notation are supported.
+
+    The first capture group contains the parameter letter, and the second
+    capture group contains the numeric literal.
+
+    Args:
+        param: Parameter letter to match, such as ``X``, ``Y``, ``Z``,
+            ``E``, or ``F``.
+
+    Returns:
+        A compiled regular expression for the parameter token.
+
+    Raises:
+        ValueError: If the parameter string is empty.
     """
     letter = param.strip().upper()
     if not letter:
-        raise ValueError("參數類型不可為空，例如 X/Y/Z/E/F。")
+        raise ValueError("The parameter type cannot be empty. Enter X, Y, Z, E, or F.")
 
     return re.compile(
         rf"({re.escape(letter)})([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
@@ -108,8 +181,47 @@ def process_gcode(
     output_path: str,
     encoding: str = "utf-8",
 ) -> Tuple[int, int]:
-    """
-    Returns (lines_matched_prefix, params_modified)
+    """Modify one parameter in selected G-code command lines.
+
+    Only lines beginning with one of the specified G-code prefixes are
+    processed. Content following a semicolon is treated as a comment and
+    is not modified.
+
+    Existing parameter values can be replaced, incremented, or scaled.
+    The original decimal precision of each parameter value is preserved.
+    Parameters that are not already present in a matching line are not
+    added.
+
+    Args:
+        input_path: Path to the input ``.gcode`` file.
+        prefixes: G-code command prefixes to process, such as
+            ``["G0", "G1"]``.
+        param: Parameter letter to modify, such as ``X``, ``Y``, ``Z``,
+            ``E``, or ``F``.
+        mode: Modification mode. Supported values are ``"set"``,
+            ``"inc"``, and ``"scale"``.
+        value: Replacement value, increment, or scaling factor, depending
+            on the selected mode.
+        output_path: Path to the output ``.gcode`` file.
+        encoding: Text encoding used to read and write the files.
+            Defaults to ``"utf-8"``.
+
+    Returns:
+        A tuple containing:
+
+        * The number of lines matching the selected G-code prefixes.
+        * The number of parameter occurrences actually modified.
+
+    Raises:
+        ValueError: If the input is not an existing ``.gcode`` file.
+        ValueError: If the output filename does not end with ``.gcode``.
+        ValueError: If ``mode`` is not ``"set"``, ``"inc"``, or
+            ``"scale"``.
+        ValueError: If the prefix list or parameter is invalid.
+        OSError: If the input file cannot be read or the output file
+            cannot be written.
+        UnicodeError: If the file cannot be decoded or encoded using the
+            selected encoding.
     """
     if not _is_gcode_file(input_path):
         raise ValueError("Input must be an existing .gcode file.")
@@ -144,6 +256,17 @@ def process_gcode(
                 lines_matched += 1
 
                 def repl(m: re.Match) -> str:
+                    """Calculate and format a replacement parameter token.
+
+                    Args:
+                        m: Regular expression match containing the parameter letter and
+                            its numeric value.
+
+                    Returns:
+                        The parameter token containing the modified numeric value. If the
+                        original value cannot be converted to ``Decimal``, the unchanged
+                        matched token is returned.
+                    """
                     nonlocal mods
                     letter = m.group(1)
                     num_str = m.group(2)
@@ -175,31 +298,45 @@ def process_gcode(
 
 
 def main():
-    print("=== G-code 全檔案一次性調整工具 ===")
-    input_path = input("1) gcode檔案名稱（.gcode）: ").strip()
+    """Run the interactive command-line interface.
 
-    prefix_in = input("2) gcode前綴 (可複數：例如 G1 或 G0,G1,G4 或 G0/G1/G4): ").strip()
+    The user is prompted to select an input file, G-code command prefixes,
+    parameter type, modification mode, modification value, and output
+    filename.
+
+    Raises:
+        ValueError: If a user-provided mode or numeric value is invalid.
+        OSError: If the input file cannot be read or the output file
+            cannot be written.
+    """
+    print("=== One-Shot G-code Parameer Editor ===")
+    input_path = input("1) Input G-code filename（.gcode）: ").strip()
+
+    prefix_in = input("2) G-code prefix or prefixes "
+                      "(e.g., G1; G0,G1,G4; or G0/G1/G4): ").strip()
     prefixes = _parse_prefixes(prefix_in)
 
-    param = input("3) 修改的參數類型 (例如 X/Y/Z/E/F): ").strip().upper()
+    param = input("3) Parameter to modify (e.g., X/Y/Z/E, or F): ").strip().upper()
 
-    mode_in = input("4) 模式：a=set(直接指定) / b=inc(增量 +/-) / c=scale(比例縮放): ").strip().lower()
+    mode_in = input("4) Modification mode: "
+                    "a = set value / b = increment(+/-) / c = scale: ").strip().lower()
+    
     if mode_in in ("a", "set"):
         mode = "set"
-        val_tip = "輸入新值"
+        val_tip = "Enter the new value"
     elif mode_in in ("b", "inc"):
         mode = "inc"
-        val_tip = "輸入增量(可負數)"
+        val_tip = "Enter the increment (may be negative)"
     elif mode_in in ("c", "scale"):
         mode = "scale"
-        val_tip = "輸入倍率(例如 1.1 / 0.95)"
+        val_tip = "Enter the scaling factor(e.g., 1.1 / 0.95)"
     else:
-        raise ValueError("模式輸入錯誤，請輸入 a / b / c。")
+        raise ValueError("Invalid modification mode. Enter a / b / c")
 
-    val_str = input(f"   4-值：{val_tip}: ").strip()
+    val_str = input(f"   4-value：{val_tip}: ").strip()
     value = Decimal(val_str)
 
-    output_path = input("5) 新的檔案名稱（.gcode）: ").strip()
+    output_path = input("5) Output G-code filename (.gcode): ").strip()
 
     lines, mods = process_gcode(
         input_path=input_path,
@@ -210,10 +347,10 @@ def main():
         output_path=output_path,
     )
 
-    print("\n=== 完成 ===")
-    print(f"匹配前綴的行數: {lines}")
-    print(f"實際修改參數次數: {mods}")
-    print(f"輸出檔案: {output_path}")
+    print("\n=== Processing Compplete ===")
+    print(f"Number of lines matching the prefixes: {lines}")
+    print(f"Number of parameter values modified: {mods}")
+    print(f"Output file: {output_path}")
 
 
 if __name__ == "__main__":

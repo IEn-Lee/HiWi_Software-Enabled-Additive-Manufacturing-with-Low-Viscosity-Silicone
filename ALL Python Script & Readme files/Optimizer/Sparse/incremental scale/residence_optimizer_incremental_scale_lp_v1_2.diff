@@ -1,0 +1,1285 @@
+--- "/mnt/data/\345\267\262\350\262\274\344\270\212\346\226\207\345\255\227 (1)(4).txt"	2026-08-06 22:17:14.742771674 +0000
++++ /mnt/data/residence_optimizer_incremental_scale_lp_v1_3.py	2026-08-06 22:21:40.499652540 +0000
+@@ -2,7 +2,12 @@
+ """
+ Sparse global residence-time optimizer for segmented G-code.
+ 
+-Version 1.1: extrusion and travel use independent feed-rate limits.
++Version 1.3: explicit scale LP with iterative incremental-scale learning.
++
++Extrusion and travel retain independent feed-rate limits. Each control block's
++normalized time scale is now an explicit LP decision variable. Cumulative
++clock variables are retained only as a sparse bookkeeping layer, linked to
++scales by linear equalities.
+ 
+ Core idea
+ ---------
+@@ -15,14 +20,39 @@
+ 1. Infers each scored material's input/output event positions from the
+    baseline timeline once.
+ 2. Groups adjacent adjustable rows into a small number of control blocks.
+-3. Expresses every residence time as a sparse linear function of cumulative
+-   block durations.
+-4. Solves two global linear programs:
++3. Creates one explicit scale variable per control block. A scale of 1 keeps
++   the original timing, >1 slows the block, and <1 speeds it up.
++4. Links scales to sparse cumulative-time variables with linear equalities,
++   then expresses every residence time from its entry/exit events.
++5. Solves two global linear programs:
+    - Stage 1: minimize the worst residence-time violation.
+    - Stage 2: preserve that optimum while minimizing target error, speed
+      changes, and block-to-block roughness.
+-5. Patches the G-code once and can optionally run the existing TRUE FIFO
+-   builder once for final validation.
++6. Optionally repeats the optimization as incremental-scale learning:
++   each LP round searches only a local scale window around 1, patches the
++   current G-code, runs TRUE FIFO, accepts only a real improvement, and then
++   rebuilds the next linear model from the accepted TRUE result.
++7. Writes the best accepted G-code, TRUE CSV, iteration history, and cumulative
++   per-row scale relative to the original input.
++
++Incremental-scale learning example
++----------------------------------
++Use --iterations greater than 1. Each round searches a local scale around the
++current accepted TRUE FIFO baseline, validates the candidate, and rebuilds the
++next model only after acceptance.
++
++python residence_optimizer_incremental_scale_lp_v1_3.py \
++  --input model_segmented.csv \
++  --gcode_in model_segmented.gcode \
++  --gcode_out model_incremental_optimized.gcode \
++  --target_mode direct --tau_min 715.75 --tau_ideal 780 --tau_max 863.10 \
++  --Fmin_extrusion 1 --Fmax_extrusion 5000 \
++  --enable_travel_opt --Fmin_travel 1 --Fmax_travel 10000 \
++  --enable_dwell_opt --Pmax_ms 780000 \
++  --block_rows 50 --block_duration_sec 4 \
++  --iterations 8 --increment_scale_limit 0.20 \
++  --trust_shrink 0.5 --trust_grow 1.15 \
++  --true_validate --vnozzle 574
+ 
+ Important assumption
+ --------------------
+@@ -32,7 +62,7 @@
+ 
+ Example (alpha bounds)
+ ----------------------
+-python residence_optimizer_sparse_v1.py \
++python residence_optimizer_sparse_scale_lp_v1_2.py \
+   --input model_segmented.csv \
+   --gcode_in model_segmented.gcode \
+   --gcode_out model_sparse_optimized.gcode \
+@@ -52,7 +82,7 @@
+ 
+ Example (direct tau bounds)
+ ---------------------------
+-python residence_optimizer_sparse_v1.py \
++python residence_optimizer_sparse_scale_lp_v1_2.py \
+   --input model_segmented.csv \
+   --target_mode direct \
+   --tau_min 1940 --tau_ideal 2000 --tau_max 2060 \
+@@ -60,7 +90,7 @@
+   --out_dir sparse_optimization
+ 
+ LiQ5 Example
+-python residence_optimizer_sparse_v1.1_separate_travel.py 
++python residence_optimizer_sparse_scale_lp_v1_2.py 
+   --input "LiQ5_sample_RTV-Body_Temp32_780s_segmented.csv" 
+   --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_segmented.gcode" 
+   --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_sparse_optimized.gcode" 
+@@ -88,10 +118,10 @@
+   --vnozzle 574
+ 
+ Alpha:
+-python residence_optimizer_sparse_v1.1_separate_travel.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimized.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimization" --target_mode alpha --temp_c 32.0 --alpha_mode bounds --alpha_min 0.879469 --alpha_ideal 0.925747 --alpha_max 0.972045 --Fmin_extrusion 50 --Fmax_extrusion 5000 --enable_travel_opt --enable_dwell_opt --block_rows 50 --block_duration_sec 12 --max_target_samples 5000 --change_weight 0.10 --smooth_weight 0.05 --target_weight 1.00 --vmax_tolerance_s 0.01 --true_validate --vnozzle 574  --Fmin_travel 50 --Fmax_travel 10000
++python residence_optimizer_sparse_scale_lp_v1_2.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimized.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimization" --target_mode alpha --temp_c 32.0 --alpha_mode bounds --alpha_min 0.879469 --alpha_ideal 0.925747 --alpha_max 0.972045 --Fmin_extrusion 50 --Fmax_extrusion 5000 --enable_travel_opt --enable_dwell_opt --block_rows 50 --block_duration_sec 12 --max_target_samples 5000 --change_weight 0.10 --smooth_weight 0.05 --target_weight 1.00 --vmax_tolerance_s 0.01 --true_validate --vnozzle 574  --Fmin_travel 50 --Fmax_travel 10000
+ 
+ Residence Time:
+-python residence_optimizer_sparse_v1.1_separate_travel.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimized.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimization" --target_mode direct --tau_min 770 --tau_ideal 800 --tau_max 840 --Fmin_extrusion 50 --Fmax_extrusion 5000 --enable_travel_opt --enable_dwell_opt --block_rows 50 --block_duration_sec 12 --max_target_samples 5000 --change_weight 0.10 --smooth_weight 0.05 --target_weight 1.00 --vmax_tolerance_s 0.01 --true_validate --vnozzle 574  --Fmin_travel 50 --Fmax_travel 10000
++python residence_optimizer_sparse_scale_lp_v1_2.py --input "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.csv" --gcode_in "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_segmented.gcode" --gcode_out "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimized.gcode" --out_dir "LiQ5_sample_RTV-Body_Temp32_780s_FT0.1_sparse_optimization" --target_mode direct --tau_min 770 --tau_ideal 800 --tau_max 840 --Fmin_extrusion 50 --Fmax_extrusion 5000 --enable_travel_opt --enable_dwell_opt --block_rows 50 --block_duration_sec 12 --max_target_samples 5000 --change_weight 0.10 --smooth_weight 0.05 --target_weight 1.00 --vmax_tolerance_s 0.01 --true_validate --vnozzle 574  --Fmin_travel 50 --Fmax_travel 10000
+ """
+ 
+ from __future__ import annotations
+@@ -99,9 +129,11 @@
+ import argparse
+ import csv
+ import importlib
++import gc
+ import json
+ import math
+ import os
++import shutil
+ import re
+ import sys
+ import time
+@@ -731,16 +763,58 @@
+         data.append(float(value))
+ 
+ 
++def block_scale_bounds(block: ControlBlock) -> Tuple[float, float]:
++    """Return the explicit LP bounds for one block time scale."""
++    base = max(block.base_duration, EPS)
++    return block.duration_lb / base, block.duration_ub / base
++
++
++def build_scale_link_equalities(
++    blocks: Sequence[ControlBlock],
++    nvar: int,
++    scale_start: int,
++) -> Tuple[csr_matrix, np.ndarray]:
++    """Build z[b+1] - z[b] = base_duration[b] * scale[b].
++
++    The z variables preserve the very sparse entry/exit event representation.
++    The scale variables are the actual control decisions optimized by HiGHS.
++    """
++    data: List[float] = []
++    rr: List[int] = []
++    cc: List[int] = []
++    rhs = np.zeros(len(blocks), dtype=float)
++    for b, block in enumerate(blocks):
++        add_sparse_row(
++            data, rr, cc, b,
++            [
++                (b + 1, 1.0),
++                (b, -1.0),
++                (scale_start + b, -block.base_duration),
++            ],
++        )
++    return coo_matrix((data, (rr, cc)), shape=(len(blocks), nvar)).tocsr(), rhs
++
++
+ def build_stage1_problem(
+     equations: Sequence[ResidenceEquation],
+     blocks: Sequence[ControlBlock],
+     tau_lo: float,
+     tau_hi: float,
+-) -> Tuple[np.ndarray, csr_matrix, np.ndarray, List[Tuple[Optional[float], Optional[float]]], int]:
++) -> Tuple[
++    np.ndarray,
++    csr_matrix,
++    np.ndarray,
++    csr_matrix,
++    np.ndarray,
++    List[Tuple[Optional[float], Optional[float]]],
++    int,
++    int,
++]:
+     B = len(blocks)
+     z_count = B + 1
+-    vmax_idx = z_count
+-    nvar = z_count + 1
++    scale_start = z_count
++    vmax_idx = scale_start + B
++    nvar = vmax_idx + 1
+ 
+     data: List[float] = []
+     rr: List[int] = []
+@@ -749,37 +823,32 @@
+     r = 0
+ 
+     for eq in equations:
+-        # tau <= tau_hi + vmax  -> weights*z - vmax <= tau_hi - constant
++        # tau <= tau_hi + vmax
+         entries = list(eq.z_weights.items()) + [(vmax_idx, -1.0)]
+         add_sparse_row(data, rr, cc, r, entries)
+         rhs.append(tau_hi - eq.constant)
+         r += 1
+ 
+-        # tau >= tau_lo - vmax -> -weights*z - vmax <= constant - tau_lo
++        # tau >= tau_lo - vmax
+         entries = [(idx, -value) for idx, value in eq.z_weights.items()] + [(vmax_idx, -1.0)]
+         add_sparse_row(data, rr, cc, r, entries)
+         rhs.append(eq.constant - tau_lo)
+         r += 1
+ 
+-    for b, block in enumerate(blocks):
+-        # y = z[b+1] - z[b] <= ub
+-        add_sparse_row(data, rr, cc, r, [(b + 1, 1.0), (b, -1.0)])
+-        rhs.append(block.duration_ub)
+-        r += 1
+-
+-        # y >= lb -> z[b] - z[b+1] <= -lb
+-        add_sparse_row(data, rr, cc, r, [(b, 1.0), (b + 1, -1.0)])
+-        rhs.append(-block.duration_lb)
+-        r += 1
+-
+     A_ub = coo_matrix((data, (rr, cc)), shape=(r, nvar)).tocsr()
+     b_ub = np.asarray(rhs, dtype=float)
++    A_eq, b_eq = build_scale_link_equalities(blocks, nvar, scale_start)
++
+     c = np.zeros(nvar, dtype=float)
+     c[vmax_idx] = 1.0
++
+     bounds: List[Tuple[Optional[float], Optional[float]]] = [(None, None)] * nvar
+     bounds[0] = (0.0, 0.0)
++    for b, block in enumerate(blocks):
++        bounds[scale_start + b] = block_scale_bounds(block)
+     bounds[vmax_idx] = (0.0, None)
+-    return c, A_ub, b_ub, bounds, vmax_idx
++
++    return c, A_ub, b_ub, A_eq, b_eq, bounds, vmax_idx, scale_start
+ 
+ 
+ def select_target_equations(
+@@ -839,12 +908,15 @@
+     np.ndarray,
+     csr_matrix,
+     np.ndarray,
++    csr_matrix,
++    np.ndarray,
+     List[Tuple[Optional[float], Optional[float]]],
+     Dict[str, object],
+ ]:
+     B = len(blocks)
+     z_count = B + 1
+-    vmax_idx = z_count
++    scale_start = z_count
++    vmax_idx = scale_start + B
+     d_start = vmax_idx + 1
+     d_count = B
+     pairs = smooth_pairs(blocks)
+@@ -861,7 +933,7 @@
+     rhs: List[float] = []
+     r = 0
+ 
+-    # Residence constraints with shared minimax slack.
++    # Residence constraints use sparse cumulative event-time variables z.
+     for eq in equations:
+         add_sparse_row(
+             data, rr, cc, r,
+@@ -877,40 +949,28 @@
+         rhs.append(eq.constant - tau_lo)
+         r += 1
+ 
+-    # Duration bounds and absolute deviation from baseline duration.
+-    for b, block in enumerate(blocks):
+-        add_sparse_row(data, rr, cc, r, [(b + 1, 1.0), (b, -1.0)])
+-        rhs.append(block.duration_ub)
+-        r += 1
+-
+-        add_sparse_row(data, rr, cc, r, [(b, 1.0), (b + 1, -1.0)])
+-        rhs.append(-block.duration_lb)
+-        r += 1
+-
++    # Absolute deviation of each explicit scale from the baseline scale 1.
++    for b in range(B):
++        s_idx = scale_start + b
+         d_idx = d_start + b
+-        # y - y0 <= d
+-        add_sparse_row(data, rr, cc, r, [(b + 1, 1.0), (b, -1.0), (d_idx, -1.0)])
+-        rhs.append(block.base_duration)
++        # scale - 1 <= d
++        add_sparse_row(data, rr, cc, r, [(s_idx, 1.0), (d_idx, -1.0)])
++        rhs.append(1.0)
+         r += 1
+-        # -(y-y0) <= d
+-        add_sparse_row(data, rr, cc, r, [(b, 1.0), (b + 1, -1.0), (d_idx, -1.0)])
+-        rhs.append(-block.base_duration)
++        # 1 - scale <= d  -> -scale - d <= -1
++        add_sparse_row(data, rr, cc, r, [(s_idx, -1.0), (d_idx, -1.0)])
++        rhs.append(-1.0)
+         r += 1
+ 
+-    # Absolute difference between neighboring normalized block scales.
++    # Absolute scale difference between neighboring compatible blocks.
+     for q_i, (a, b) in enumerate(pairs):
+         q_idx = q_start + q_i
+-        ya = max(blocks[a].base_duration, EPS)
+-        yb = max(blocks[b].base_duration, EPS)
+-        entries = [
+-            (b + 1, 1.0 / yb), (b, -1.0 / yb),
+-            (a + 1, -1.0 / ya), (a, 1.0 / ya),
+-            (q_idx, -1.0),
+-        ]
+-        add_sparse_row(data, rr, cc, r, entries)
++        sa_idx = scale_start + a
++        sb_idx = scale_start + b
++        add_sparse_row(data, rr, cc, r, [(sb_idx, 1.0), (sa_idx, -1.0), (q_idx, -1.0)])
+         rhs.append(0.0)
+         r += 1
+-        add_sparse_row(data, rr, cc, r, [(idx, -value) for idx, value in entries[:-1]] + [(q_idx, -1.0)])
++        add_sparse_row(data, rr, cc, r, [(sa_idx, 1.0), (sb_idx, -1.0), (q_idx, -1.0)])
+         rhs.append(0.0)
+         r += 1
+ 
+@@ -921,17 +981,20 @@
+         add_sparse_row(data, rr, cc, r, list(eq.z_weights.items()) + [(e_idx, -1.0)])
+         rhs.append(tau_star - eq.constant)
+         r += 1
+-        add_sparse_row(data, rr, cc, r, [(idx, -value) for idx, value in eq.z_weights.items()] + [(e_idx, -1.0)])
++        add_sparse_row(
++            data, rr, cc, r,
++            [(idx, -value) for idx, value in eq.z_weights.items()] + [(e_idx, -1.0)],
++        )
+         rhs.append(eq.constant - tau_star)
+         r += 1
+ 
+     A_ub = coo_matrix((data, (rr, cc)), shape=(r, nvar)).tocsr()
+     b_ub = np.asarray(rhs, dtype=float)
++    A_eq, b_eq = build_scale_link_equalities(blocks, nvar, scale_start)
+     c = np.zeros(nvar, dtype=float)
+ 
+     if B > 0 and change_weight > 0.0:
+-        for b, block in enumerate(blocks):
+-            c[d_start + b] = change_weight / (B * max(block.base_duration, EPS))
++        c[d_start:d_start + B] = change_weight / B
+ 
+     if q_count > 0 and smooth_weight > 0.0:
+         c[q_start:q_start + q_count] = smooth_weight / q_count
+@@ -942,18 +1005,22 @@
+ 
+     if time_weight > 0.0:
+         total_variable = max(sum(b.base_duration for b in blocks), EPS)
+-        c[B] += time_weight / total_variable  # z[B] is total adjustable time.
++        for b, block in enumerate(blocks):
++            c[scale_start + b] += time_weight * block.base_duration / total_variable
+ 
+     # Tiny objective on vmax improves numerical preference when tolerance is nonzero.
+     c[vmax_idx] = 1e-9
+ 
+     bounds: List[Tuple[Optional[float], Optional[float]]] = [(None, None)] * nvar
+     bounds[0] = (0.0, 0.0)
++    for b, block in enumerate(blocks):
++        bounds[scale_start + b] = block_scale_bounds(block)
+     bounds[vmax_idx] = (0.0, max(0.0, vmax_upper))
+     for idx in range(d_start, nvar):
+         bounds[idx] = (0.0, None)
+ 
+     metadata: Dict[str, object] = {
++        "scale_start": scale_start,
+         "vmax_idx": vmax_idx,
+         "d_start": d_start,
+         "q_start": q_start,
+@@ -962,14 +1029,17 @@
+         "smooth_pairs": pairs,
+         "variable_count": nvar,
+         "constraint_count": r,
++        "equality_count": B,
+     }
+-    return c, A_ub, b_ub, bounds, metadata
++    return c, A_ub, b_ub, A_eq, b_eq, bounds, metadata
+ 
+ 
+ def solve_lp(
+     c: np.ndarray,
+     A_ub: csr_matrix,
+     b_ub: np.ndarray,
++    A_eq: Optional[csr_matrix],
++    b_eq: Optional[np.ndarray],
+     bounds: Sequence[Tuple[Optional[float], Optional[float]]],
+     time_limit: float,
+     label: str,
+@@ -982,6 +1052,8 @@
+         c=c,
+         A_ub=A_ub,
+         b_ub=b_ub,
++        A_eq=A_eq,
++        b_eq=b_eq,
+         bounds=list(bounds),
+         method="highs",
+         options=options,
+@@ -1002,16 +1074,21 @@
+ def solution_to_rows(
+     rows: Sequence[Row],
+     blocks: Sequence[ControlBlock],
+-    z: np.ndarray,
++    scales: np.ndarray,
+ ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """Apply the LP-optimized block scales directly to row timing and F/P."""
++    if len(scales) != len(blocks):
++        raise ValueError("Scale vector length does not match control block count")
++
+     F_new = np.array([r.F for r in rows], dtype=float)
+     P_new_ms = np.array([r.t_s * 1000.0 if r.cmd == "G4" else 0.0 for r in rows], dtype=float)
+     t_new = np.array([r.t_s for r in rows], dtype=float)
+     row_scale = np.ones(len(rows), dtype=float)
+ 
+-    y = np.diff(z)
+     for block in blocks:
+-        scale = y[block.index] / max(block.base_duration, EPS)
++        scale = float(scales[block.index])
++        if not math.isfinite(scale) or scale <= EPS:
++            raise ValueError(f"Block {block.index} has invalid optimized scale={scale}")
+         for i in block.row_indices:
+             row = rows[i]
+             row_scale[i] = scale
+@@ -1020,7 +1097,7 @@
+                 P_new_ms[i] = t_new[i] * 1000.0
+             else:
+                 F0 = infer_feedrate(row)
+-                if scale > EPS and F0 > EPS:
++                if F0 > EPS:
+                     F_new[i] = F0 / scale
+ 
+     return F_new, P_new_ms, t_new, row_scale
+@@ -1194,7 +1271,7 @@
+     P_new_ms: np.ndarray,
+     t_new: np.ndarray,
+     row_scale: np.ndarray,
+-    z: np.ndarray,
++    scales: np.ndarray,
+ ) -> Tuple[str, str]:
+     os.makedirs(out_dir, exist_ok=True)
+ 
+@@ -1216,10 +1293,10 @@
+     prediction_path = os.path.join(out_dir, "optimized_prediction.csv")
+     output_df.to_csv(prediction_path, index=False, float_format="%.8f")
+ 
+-    y = np.diff(z)
+     block_records = []
+     for block in blocks:
+-        y_new = y[block.index]
++        scale = float(scales[block.index])
++        y_new = block.base_duration * scale
+         block_records.append(
+             {
+                 "block": block.index,
+@@ -1229,7 +1306,9 @@
+                 "row_count": len(block.row_indices),
+                 "base_duration_s": block.base_duration,
+                 "optimized_duration_s": y_new,
+-                "time_scale": y_new / max(block.base_duration, EPS),
++                "time_scale": scale,
++                "scale_lb": block.duration_lb / max(block.base_duration, EPS),
++                "scale_ub": block.duration_ub / max(block.base_duration, EPS),
+                 "duration_lb_s": block.duration_lb,
+                 "duration_ub_s": block.duration_ub,
+                 "base_f_min": block.base_f_min,
+@@ -1273,6 +1352,389 @@
+     }
+ 
+ 
++def scored_tau_from_csv(path: str) -> np.ndarray:
++    """Read the authoritative TRUE FIFO tau values used for acceptance."""
++    rows, _ = read_segments_csv(path)
++    tau = np.asarray(
++        [r.tau_s for r in rows if is_scored_extrusion_row(r) and math.isfinite(r.tau_s)],
++        dtype=float,
++    )
++    if tau.size == 0:
++        raise ValueError(f"No finite scored residence times were found in {path}")
++    return tau
++
++
++def apply_increment_scale_window(
++    blocks: Sequence[ControlBlock],
++    scale_min: float,
++    scale_max: float,
++) -> Dict[str, float]:
++    """Intersect absolute machine bounds with the current local scale window.
++
++    The LP scale is incremental: scale=1 keeps the current accepted timing,
++    scale>1 slows the current block, and scale<1 speeds it up.
++    """
++    if not (0.0 < scale_min <= 1.0 <= scale_max):
++        raise ValueError("Increment scale window must satisfy 0 < min <= 1 <= max")
++
++    active_lows: List[float] = []
++    active_highs: List[float] = []
++    clipped = 0
++    for block in blocks:
++        absolute_lo, absolute_hi = block_scale_bounds(block)
++        local_lo = max(absolute_lo, scale_min)
++        local_hi = min(absolute_hi, scale_max)
++        if local_lo > local_hi + 1e-12:
++            raise ValueError(
++                f"Block {block.index} has no feasible incremental scale: "
++                f"absolute=[{absolute_lo:.8g}, {absolute_hi:.8g}], "
++                f"local=[{scale_min:.8g}, {scale_max:.8g}]"
++            )
++        if local_lo > absolute_lo + 1e-12 or local_hi < absolute_hi - 1e-12:
++            clipped += 1
++        block.duration_lb = block.base_duration * local_lo
++        block.duration_ub = block.base_duration * local_hi
++        active_lows.append(local_lo)
++        active_highs.append(local_hi)
++
++    return {
++        "requested_min": float(scale_min),
++        "requested_max": float(scale_max),
++        "active_min": float(min(active_lows)),
++        "active_max": float(max(active_highs)),
++        "clipped_block_count": int(clipped),
++    }
++
++
++def compare_metric_priority(
++    candidate: Dict[str, float],
++    current: Dict[str, float],
++    tolerance_s: float,
++) -> Tuple[bool, str]:
++    """Accept TRUE results lexicographically.
++
++    Priority follows the two-stage optimizer:
++    1. lower worst violation;
++    2. with effectively equal worst violation, fewer violating rows;
++    3. then lower total violation;
++    4. then lower mean absolute target error.
++    """
++    tol = max(0.0, float(tolerance_s))
++    cand_v = float(candidate["vmax_s"])
++    curr_v = float(current["vmax_s"])
++    if cand_v < curr_v - tol:
++        return True, "lower_true_vmax"
++    if cand_v > curr_v + tol:
++        return False, "higher_true_vmax"
++
++    cand_count = int(candidate["violation_count"])
++    curr_count = int(current["violation_count"])
++    if cand_count < curr_count:
++        return True, "fewer_true_violations"
++    if cand_count > curr_count:
++        return False, "more_true_violations"
++
++    cand_sum = float(candidate["violation_sum_s"])
++    curr_sum = float(current["violation_sum_s"])
++    if cand_sum < curr_sum - tol:
++        return True, "lower_true_violation_sum"
++    if cand_sum > curr_sum + tol:
++        return False, "higher_true_violation_sum"
++
++    cand_target = float(candidate["mean_abs_target_error_s"])
++    curr_target = float(current["mean_abs_target_error_s"])
++    if cand_target < curr_target - tol:
++        return True, "lower_true_target_error"
++    return False, "no_material_true_improvement"
++
++
++def cumulative_scale_table(original_csv: str, final_csv: str) -> pd.DataFrame:
++    """Compute authoritative cumulative row time scale from TRUE CSV timing."""
++    original_rows, _ = read_segments_csv(original_csv)
++    final_rows, _ = read_segments_csv(final_csv)
++    original_map = {r.seg_idx: r for r in original_rows}
++    records: List[Dict[str, object]] = []
++    for row in final_rows:
++        base = original_map.get(row.seg_idx)
++        if base is None:
++            continue
++        if base.t_s > EPS:
++            cumulative = row.t_s / base.t_s
++        elif row.t_s <= EPS:
++            cumulative = 1.0
++        else:
++            cumulative = math.nan
++        records.append(
++            {
++                "seg_idx": row.seg_idx,
++                "cmd": row.cmd,
++                "note": row.note,
++                "original_t_s": base.t_s,
++                "final_true_t_s": row.t_s,
++                "cumulative_time_scale": cumulative,
++                "original_F_mm_per_min": base.F,
++                "final_F_mm_per_min": row.F,
++            }
++        )
++    return pd.DataFrame(records)
++
++
++def optimize_one_scale_round(
++    *,
++    args: argparse.Namespace,
++    input_csv: str,
++    gcode_in: Optional[str],
++    round_dir: str,
++    tau_lo: float,
++    tau_star: float,
++    tau_hi: float,
++    tau_grid: Optional[np.ndarray],
++    alpha_grid: Optional[np.ndarray],
++    increment_scale_min: Optional[float],
++    increment_scale_max: Optional[float],
++    run_true: bool,
++) -> Dict[str, object]:
++    """Solve one explicit-scale LP around the current authoritative baseline."""
++    os.makedirs(round_dir, exist_ok=True)
++    rows, source_df = read_segments_csv(input_csv)
++    blocks, row_to_block = build_control_blocks(
++        rows=rows,
++        enable_travel_opt=args.enable_travel_opt,
++        enable_dwell_opt=args.enable_dwell_opt,
++        block_rows=args.block_rows,
++        block_duration_sec=args.block_duration_sec,
++        Fmin_extrusion=args.Fmin_extrusion_resolved,
++        Fmax_extrusion=args.Fmax_extrusion_resolved,
++        Fmin_travel=args.Fmin_travel_resolved,
++        Fmax_travel=args.Fmax_travel_resolved,
++        Pmin_ms=args.Pmin_ms,
++        Pmax_ms=args.Pmax_ms,
++        max_relative_F_change=args.max_relative_F_change,
++        max_relative_P_change=args.max_relative_P_change,
++    )
++
++    increment_window = None
++    if increment_scale_min is not None and increment_scale_max is not None:
++        increment_window = apply_increment_scale_window(
++            blocks, increment_scale_min, increment_scale_max
++        )
++
++    equations, model_diag = build_residence_equations(rows, blocks)
++    z0 = baseline_z(blocks)
++    baseline_tau_model = evaluate_equations(equations, z0)
++    baseline_tau_csv = np.asarray([eq.baseline_tau for eq in equations], dtype=float)
++    reconstruction_abs_max = float(np.max(np.abs(baseline_tau_model - baseline_tau_csv)))
++    baseline_metrics = residence_metrics(baseline_tau_csv, tau_lo, tau_star, tau_hi)
++
++    print(f"  Loaded {len(rows):,} rows; {len(blocks):,} blocks; {len(equations):,} equations")
++    if increment_window is not None:
++        print(
++            "  Increment scale window: "
++            f"[{increment_window['requested_min']:.6g}, {increment_window['requested_max']:.6g}]"
++        )
++    print(
++        f"  Current TRUE baseline: within={baseline_metrics['within_percent']:.3f}% "
++        f"violations={baseline_metrics['violation_count']:,} "
++        f"vmax={baseline_metrics['vmax_s']:.6f}s"
++    )
++
++    c1, A1, b1, Aeq1, beq1, bounds1, vmax_idx1, scale_start1 = build_stage1_problem(
++        equations, blocks, tau_lo, tau_hi
++    )
++    print(
++        f"  Stage 1 LP: variables={A1.shape[1]:,}, constraints={A1.shape[0]:,}, "
++        f"equalities={Aeq1.shape[0]:,}, nonzeros={A1.nnz + Aeq1.nnz:,}"
++    )
++    stage1, stage1_sec = solve_lp(
++        c1, A1, b1, Aeq1, beq1, bounds1, args.solver_time_limit, "Stage 1 minimax"
++    )
++    vmax_star = max(0.0, float(stage1.x[vmax_idx1]))
++    B = len(blocks)
++    stage1_z = np.asarray(stage1.x[:B + 1], dtype=float)
++    stage1_scales = np.asarray(stage1.x[scale_start1:scale_start1 + B], dtype=float)
++    np.savez_compressed(
++        os.path.join(round_dir, "stage1_checkpoint.npz"),
++        z=stage1_z,
++        scales=stage1_scales,
++        minimal_worst_violation_s=vmax_star,
++    )
++    print(f"  Stage 1 complete in {stage1_sec:.3f}s; minimal worst violation={vmax_star:.6f}s")
++
++    # Release the first LP matrices before constructing Stage 2.
++    del c1, A1, b1, Aeq1, beq1, bounds1
++    gc.collect()
++
++    solution_source = "stage2"
++    stage2_sec = 0.0
++    stage2_message = None
++    target_sample_count = 0
++    vmax_upper = vmax_star + max(0.0, args.vmax_tolerance_s)
++    try:
++        c2, A2, b2, Aeq2, beq2, bounds2, meta2 = build_stage2_problem(
++            equations=equations,
++            blocks=blocks,
++            tau_lo=tau_lo,
++            tau_star=tau_star,
++            tau_hi=tau_hi,
++            vmax_upper=vmax_upper,
++            max_target_samples=args.max_target_samples,
++            change_weight=args.change_weight,
++            smooth_weight=args.smooth_weight,
++            target_weight=args.target_weight,
++            time_weight=args.time_weight,
++        )
++        target_sample_count = len(meta2["target_indices"])
++        print(
++            f"  Stage 2 LP: variables={A2.shape[1]:,}, constraints={A2.shape[0]:,}, "
++            f"equalities={Aeq2.shape[0]:,}, nonzeros={A2.nnz + Aeq2.nnz:,}, "
++            f"target_samples={target_sample_count:,}"
++        )
++        stage2, stage2_sec = solve_lp(
++            c2, A2, b2, Aeq2, beq2, bounds2, args.solver_time_limit, "Stage 2 quality"
++        )
++        z_opt = np.asarray(stage2.x[:B + 1], dtype=float)
++        scale_start2 = int(meta2["scale_start"])
++        scales_opt = np.asarray(stage2.x[scale_start2:scale_start2 + B], dtype=float)
++        stage2_message = str(stage2.message)
++        del c2, A2, b2, Aeq2, beq2, bounds2
++        gc.collect()
++    except Exception as exc:
++        if args.no_stage2_fallback:
++            raise
++        print(f"  Warning: Stage 2 failed; using saved Stage 1 scale solution: {exc}")
++        solution_source = "stage1_fallback"
++        z_opt = stage1_z
++        scales_opt = stage1_scales
++        stage2_message = f"fallback_after_error: {exc}"
++
++    tau_pred = evaluate_equations(equations, z_opt)
++    predicted_metrics = residence_metrics(tau_pred, tau_lo, tau_star, tau_hi)
++    print(
++        f"  Predicted candidate: within={predicted_metrics['within_percent']:.3f}% "
++        f"violations={predicted_metrics['violation_count']:,} "
++        f"vmax={predicted_metrics['vmax_s']:.6f}s"
++    )
++
++    F_new, P_new_ms, t_new, row_scale = solution_to_rows(rows, blocks, scales_opt)
++    alpha_pred = alpha_from_tau(tau_pred, tau_grid, alpha_grid) if tau_grid is not None else None
++    prediction_path, block_path = write_outputs(
++        out_dir=round_dir,
++        source_df=source_df,
++        rows=rows,
++        blocks=blocks,
++        row_to_block=row_to_block,
++        equations=equations,
++        tau_pred=tau_pred,
++        alpha_pred=alpha_pred,
++        F_new=F_new,
++        P_new_ms=P_new_ms,
++        t_new=t_new,
++        row_scale=row_scale,
++        scales=scales_opt,
++    )
++
++    candidate_gcode = None
++    patch_info = None
++    if gcode_in:
++        candidate_gcode = os.path.join(round_dir, "candidate_optimized.gcode")
++        patched, expected = patch_gcode_by_segidx(
++            gcode_in, candidate_gcode, rows, F_new, P_new_ms,
++            args.enable_travel_opt, args.enable_dwell_opt,
++        )
++        patch_info = {
++            "patched": int(patched),
++            "expected": int(expected),
++            "coverage": float(patched / max(1, expected)),
++        }
++        print(f"  Patched G-code: {patched}/{expected} ({patch_info['coverage']:.6f})")
++        if expected > 0 and patch_info["coverage"] < 0.98:
++            raise RuntimeError("G-code patch coverage is below 98%")
++
++    true_csv = None
++    true_gcode = None
++    true_metrics = None
++    true_comparison = None
++    if run_true:
++        if candidate_gcode is None:
++            raise ValueError("TRUE validation requires a current G-code input")
++        true_csv, true_gcode = run_true_validation(
++            module_name=args.true_builder_module,
++            gcode_in=candidate_gcode,
++            out_dir=round_dir,
++            V_nozzle=args.vnozzle,
++            d_filament=args.d_filament,
++            e_mode=args.e_mode,
++        )
++        true_comparison = compare_true_validation(true_csv, equations, tau_pred)
++        true_metrics = residence_metrics(
++            scored_tau_from_csv(true_csv), tau_lo, tau_star, tau_hi
++        )
++        print(
++            f"  TRUE candidate: within={true_metrics['within_percent']:.3f}% "
++            f"violations={true_metrics['violation_count']:,} "
++            f"vmax={true_metrics['vmax_s']:.6f}s; "
++            f"prediction RMSE={true_comparison['true_minus_pred_rmse_s']:.6f}s"
++        )
++
++    round_summary = {
++        "input_csv": os.path.abspath(input_csv),
++        "gcode_in": os.path.abspath(gcode_in) if gcode_in else None,
++        "row_count": len(rows),
++        "control_block_count": len(blocks),
++        "model": model_diag,
++        "baseline_reconstruction_abs_max_s": reconstruction_abs_max,
++        "increment_window": increment_window,
++        "baseline_metrics": baseline_metrics,
++        "stage1": {
++            "elapsed_s": stage1_sec,
++            "minimal_worst_violation_s": vmax_star,
++            "solver_message": str(stage1.message),
++        },
++        "stage2": {
++            "elapsed_s": stage2_sec,
++            "allowed_worst_violation_s": vmax_upper,
++            "solver_message": stage2_message,
++            "target_sample_count": target_sample_count,
++            "solution_source": solution_source,
++        },
++        "scale_statistics": {
++            "min": float(np.min(scales_opt)),
++            "max": float(np.max(scales_opt)),
++            "mean": float(np.mean(scales_opt)),
++            "median": float(np.median(scales_opt)),
++        },
++        "predicted_metrics": predicted_metrics,
++        "patch": patch_info,
++        "true_metrics": true_metrics,
++        "true_validation": true_comparison,
++        "files": {
++            "prediction_csv": os.path.abspath(prediction_path),
++            "block_csv": os.path.abspath(block_path),
++            "candidate_gcode": os.path.abspath(candidate_gcode) if candidate_gcode else None,
++            "true_csv": os.path.abspath(true_csv) if true_csv else None,
++            "true_gcode": os.path.abspath(true_gcode) if true_gcode else None,
++        },
++    }
++    with open(os.path.join(round_dir, "round_summary.json"), "w", encoding="utf-8") as f:
++        json.dump(round_summary, f, ensure_ascii=False, indent=2)
++
++    return {
++        "rows": rows,
++        "row_to_block": row_to_block,
++        "blocks": blocks,
++        "equations": equations,
++        "scales": scales_opt,
++        "baseline_metrics": baseline_metrics,
++        "predicted_metrics": predicted_metrics,
++        "true_metrics": true_metrics,
++        "true_comparison": true_comparison,
++        "candidate_gcode": candidate_gcode,
++        "true_csv": true_csv,
++        "true_gcode": true_gcode,
++        "round_summary": round_summary,
++    }
++
++
+ # ---------------------------------------------------------------------------
+ # CLI
+ # ---------------------------------------------------------------------------
+@@ -1339,6 +1801,26 @@
+     ap.add_argument("--solver_time_limit", type=float, default=0.0,
+                     help="Seconds per LP; 0 means no explicit limit")
+ 
++    # Incremental scale learning / sequential LP controls.
++    ap.add_argument("--iterations", type=int, default=1,
++                    help="Number of LP/TRUE-FIFO rounds; values >1 enable incremental-scale learning")
++    ap.add_argument("--increment_scale_limit", type=float, default=0.20,
++                    help="Initial local time-scale radius: scale is limited to [1-limit, 1+limit]")
++    ap.add_argument("--max_increment_scale_limit", type=float, default=0.50,
++                    help="Maximum local scale radius after successful rounds")
++    ap.add_argument("--min_increment_scale_limit", type=float, default=0.01,
++                    help="Stop when rejected rounds shrink the local scale radius below this value")
++    ap.add_argument("--trust_shrink", type=float, default=0.50,
++                    help="Multiplier applied to the scale radius after a rejected TRUE result")
++    ap.add_argument("--trust_grow", type=float, default=1.15,
++                    help="Multiplier applied to the scale radius after an accepted TRUE result")
++    ap.add_argument("--accept_tolerance_s", type=float, default=0.001,
++                    help="Tolerance for comparing TRUE FIFO metrics between rounds")
++    ap.add_argument("--patience", type=int, default=3,
++                    help="Stop after this many consecutive rejected TRUE candidates")
++    ap.add_argument("--no_stage2_fallback", action="store_true",
++                    help="Fail instead of falling back to the saved Stage-1 scale solution")
++
+     ap.add_argument("--true_validate", action="store_true")
+     ap.add_argument("--true_builder_module", default="rebuild_csv_and_gcode_fifo_v1_2_precondition_autofill")
+     ap.add_argument("--vnozzle", type=float, default=574.0)
+@@ -1434,6 +1916,24 @@
+         raise ValueError("Require 0 <= Pmin_ms < Pmax_ms")
+     if args.block_rows < 1:
+         raise ValueError("block_rows must be >= 1")
++    if args.iterations < 1:
++        raise ValueError("iterations must be >= 1")
++    if not (0.0 < args.increment_scale_limit < 1.0):
++        raise ValueError("increment_scale_limit must satisfy 0 < value < 1")
++    if not (0.0 < args.min_increment_scale_limit <= args.increment_scale_limit):
++        raise ValueError("Require 0 < min_increment_scale_limit <= increment_scale_limit")
++    if not (args.increment_scale_limit <= args.max_increment_scale_limit < 1.0):
++        raise ValueError("Require increment_scale_limit <= max_increment_scale_limit < 1")
++    if not (0.0 < args.trust_shrink < 1.0):
++        raise ValueError("trust_shrink must satisfy 0 < value < 1")
++    if args.trust_grow < 1.0:
++        raise ValueError("trust_grow must be >= 1")
++    if args.accept_tolerance_s < 0.0:
++        raise ValueError("accept_tolerance_s must be >= 0")
++    if args.patience < 1:
++        raise ValueError("patience must be >= 1")
++    if args.iterations > 1 and not args.gcode_in:
++        raise ValueError("incremental-scale learning (--iterations > 1) requires --gcode_in")
+     for name in ("change_weight", "smooth_weight", "target_weight", "time_weight"):
+         if getattr(args, name) < 0.0:
+             raise ValueError(f"{name} must be >= 0")
+@@ -1451,166 +1951,166 @@
+ 
+         print("=" * 78)
+         print("Sparse global residence-time optimizer")
++        print("Mode: explicit LP scale variables + incremental TRUE-FIFO learning")
+         print(f"Target tau window: [{tau_lo:.6f}, {tau_hi:.6f}] s; ideal={tau_star:.6f} s")
+-        print("Assumption: E/volume, G-code order, V_nozzle, and FIFO pairing stay fixed.")
+         print(
+             "Feed-rate bounds: "
+             f"extrusion=[{args.Fmin_extrusion_resolved:.6g}, {args.Fmax_extrusion_resolved:.6g}] mm/min; "
+             f"travel=[{args.Fmin_travel_resolved:.6g}, {args.Fmax_travel_resolved:.6g}] mm/min"
+         )
+ 
+-        rows, source_df = read_segments_csv(args.input)
+-        print(f"Loaded {len(rows):,} CSV rows")
++        original_csv = os.path.abspath(args.input)
++        current_csv = original_csv
++        current_gcode = os.path.abspath(args.gcode_in) if args.gcode_in else None
++        initial_tau = scored_tau_from_csv(current_csv)
++        current_true_metrics = residence_metrics(initial_tau, tau_lo, tau_star, tau_hi)
++        initial_true_metrics = dict(current_true_metrics)
++
++        incremental_mode = args.iterations > 1
++        run_true_each_round = bool(args.true_validate or incremental_mode)
++        radius = float(args.increment_scale_limit)
++        consecutive_rejections = 0
++        accepted_rounds = 0
++        history: List[Dict[str, object]] = []
++        best_round_result: Optional[Dict[str, object]] = None
++
++        for attempt in range(1, args.iterations + 1):
++            round_dir = os.path.join(args.out_dir, f"iteration_{attempt:03d}")
++            print("-" * 78)
++            print(
++                f"Iteration {attempt}/{args.iterations}; accepted={accepted_rounds}; "
++                f"current TRUE within={current_true_metrics['within_percent']:.3f}%, "
++                f"vmax={current_true_metrics['vmax_s']:.6f}s"
++            )
+ 
+-        blocks, row_to_block = build_control_blocks(
+-            rows=rows,
+-            enable_travel_opt=args.enable_travel_opt,
+-            enable_dwell_opt=args.enable_dwell_opt,
+-            block_rows=args.block_rows,
+-            block_duration_sec=args.block_duration_sec,
+-            Fmin_extrusion=args.Fmin_extrusion_resolved,
+-            Fmax_extrusion=args.Fmax_extrusion_resolved,
+-            Fmin_travel=args.Fmin_travel_resolved,
+-            Fmax_travel=args.Fmax_travel_resolved,
+-            Pmin_ms=args.Pmin_ms,
+-            Pmax_ms=args.Pmax_ms,
+-            max_relative_F_change=args.max_relative_F_change,
+-            max_relative_P_change=args.max_relative_P_change,
+-        )
+-        print(f"Created {len(blocks):,} control blocks")
+-
+-        equations, model_diag = build_residence_equations(rows, blocks)
+-        print(f"Built {len(equations):,} sparse residence equations")
+-        if model_diag["skipped_scored_rows"]:
+-            print(f"Warning: skipped {model_diag['skipped_scored_rows']} scored rows with invalid timing")
+-
+-        z0 = baseline_z(blocks)
+-        baseline_tau_model = evaluate_equations(equations, z0)
+-        baseline_tau_csv = np.array([eq.baseline_tau for eq in equations], dtype=float)
+-        baseline_reconstruction_error = baseline_tau_model - baseline_tau_csv
+-        reconstruction_abs_max = float(np.max(np.abs(baseline_reconstruction_error)))
+-        print(f"Baseline reconstruction max error: {reconstruction_abs_max:.3e} s")
++            inc_min = max(EPS, 1.0 - radius) if incremental_mode else None
++            inc_max = 1.0 + radius if incremental_mode else None
++            result = optimize_one_scale_round(
++                args=args,
++                input_csv=current_csv,
++                gcode_in=current_gcode,
++                round_dir=round_dir,
++                tau_lo=tau_lo,
++                tau_star=tau_star,
++                tau_hi=tau_hi,
++                tau_grid=tau_grid,
++                alpha_grid=alpha_grid,
++                increment_scale_min=inc_min,
++                increment_scale_max=inc_max,
++                run_true=run_true_each_round,
++            )
+ 
+-        baseline_metrics = residence_metrics(baseline_tau_csv, tau_lo, tau_star, tau_hi)
+-        print(
+-            f"Baseline: within={baseline_metrics['within_percent']:.3f}% "
+-            f"violations={baseline_metrics['violation_count']:,} "
+-            f"vmax={baseline_metrics['vmax_s']:.6f}s"
+-        )
++            if run_true_each_round:
++                candidate_metrics = result["true_metrics"]
++                assert isinstance(candidate_metrics, dict)
++                accepted, reason = compare_metric_priority(
++                    candidate_metrics, current_true_metrics, args.accept_tolerance_s
++                )
++            else:
++                candidate_metrics = result["predicted_metrics"]
++                accepted, reason = True, "single_round_prediction"
+ 
+-        c1, A1, b1, bounds1, vmax_idx1 = build_stage1_problem(
+-            equations, blocks, tau_lo, tau_hi
+-        )
+-        print(
+-            f"Stage 1 LP: variables={A1.shape[1]:,}, constraints={A1.shape[0]:,}, "
+-            f"nonzeros={A1.nnz:,}"
+-        )
+-        stage1, stage1_sec = solve_lp(
+-            c1, A1, b1, bounds1, args.solver_time_limit, "Stage 1 minimax"
+-        )
+-        vmax_star = max(0.0, float(stage1.x[vmax_idx1]))
+-        print(f"Stage 1 complete in {stage1_sec:.3f}s; minimal worst violation={vmax_star:.6f}s")
++            record: Dict[str, object] = {
++                "attempt": attempt,
++                "increment_scale_radius": radius if incremental_mode else None,
++                "increment_scale_min": inc_min,
++                "increment_scale_max": inc_max,
++                "accepted": bool(accepted),
++                "acceptance_reason": reason,
++                "baseline_metrics": result["baseline_metrics"],
++                "predicted_metrics": result["predicted_metrics"],
++                "true_metrics": result["true_metrics"],
++                "true_validation": result["true_comparison"],
++                "round_dir": os.path.abspath(round_dir),
++            }
++            history.append(record)
+ 
+-        vmax_upper = vmax_star + max(0.0, args.vmax_tolerance_s)
+-        c2, A2, b2, bounds2, meta2 = build_stage2_problem(
+-            equations=equations,
+-            blocks=blocks,
+-            tau_lo=tau_lo,
+-            tau_star=tau_star,
+-            tau_hi=tau_hi,
+-            vmax_upper=vmax_upper,
+-            max_target_samples=args.max_target_samples,
+-            change_weight=args.change_weight,
+-            smooth_weight=args.smooth_weight,
+-            target_weight=args.target_weight,
+-            time_weight=args.time_weight,
+-        )
+-        print(
+-            f"Stage 2 LP: variables={A2.shape[1]:,}, constraints={A2.shape[0]:,}, "
+-            f"nonzeros={A2.nnz:,}, target_samples={len(meta2['target_indices']):,}"
+-        )
+-        stage2, stage2_sec = solve_lp(
+-            c2, A2, b2, bounds2, args.solver_time_limit, "Stage 2 quality"
+-        )
++            if accepted:
++                accepted_rounds += 1
++                consecutive_rejections = 0
++                best_round_result = result
++                if run_true_each_round:
++                    assert result["true_csv"] is not None and result["true_gcode"] is not None
++                    current_csv = str(result["true_csv"])
++                    current_gcode = str(result["true_gcode"])
++                    current_true_metrics = dict(candidate_metrics)
++                else:
++                    current_true_metrics = dict(candidate_metrics)
++                    if result["candidate_gcode"] is not None:
++                        current_gcode = str(result["candidate_gcode"])
++                print(f"  ACCEPTED: {reason}")
++                if incremental_mode:
++                    radius = min(args.max_increment_scale_limit, radius * args.trust_grow)
++            else:
++                consecutive_rejections += 1
++                print(f"  REJECTED: {reason}; keeping previous TRUE baseline")
++                if incremental_mode:
++                    radius *= args.trust_shrink
++                    print(f"  Trust radius shrunk to {radius:.6g}")
++                    if radius < args.min_increment_scale_limit:
++                        print("  Stopping: incremental scale radius is below the configured minimum")
++                        break
++                    if consecutive_rejections >= args.patience:
++                        print("  Stopping: rejection patience reached")
++                        break
++
++        history_path = os.path.join(args.out_dir, "incremental_history.csv")
++        flat_history: List[Dict[str, object]] = []
++        for rec in history:
++            base = rec["baseline_metrics"] or {}
++            pred = rec["predicted_metrics"] or {}
++            true = rec["true_metrics"] or {}
++            comp = rec["true_validation"] or {}
++            flat_history.append(
++                {
++                    "attempt": rec["attempt"],
++                    "accepted": rec["accepted"],
++                    "acceptance_reason": rec["acceptance_reason"],
++                    "increment_scale_radius": rec["increment_scale_radius"],
++                    "baseline_within_percent": base.get("within_percent"),
++                    "baseline_vmax_s": base.get("vmax_s"),
++                    "predicted_within_percent": pred.get("within_percent"),
++                    "predicted_vmax_s": pred.get("vmax_s"),
++                    "true_within_percent": true.get("within_percent"),
++                    "true_vmax_s": true.get("vmax_s"),
++                    "true_violation_count": true.get("violation_count"),
++                    "true_violation_sum_s": true.get("violation_sum_s"),
++                    "true_mean_abs_target_error_s": true.get("mean_abs_target_error_s"),
++                    "prediction_rmse_s": comp.get("true_minus_pred_rmse_s"),
++                    "round_dir": rec["round_dir"],
++                }
++            )
++        pd.DataFrame(flat_history).to_csv(history_path, index=False, float_format="%.8f")
+ 
+-        B = len(blocks)
+-        z_opt = np.asarray(stage2.x[:B + 1], dtype=float)
+-        tau_pred = evaluate_equations(equations, z_opt)
+-        optimized_metrics = residence_metrics(tau_pred, tau_lo, tau_star, tau_hi)
+-        print(
+-            f"Optimized: within={optimized_metrics['within_percent']:.3f}% "
+-            f"violations={optimized_metrics['violation_count']:,} "
+-            f"vmax={optimized_metrics['vmax_s']:.6f}s"
++        final_csv = current_csv
++        final_gcode = current_gcode
++        final_csv_copy = os.path.join(args.out_dir, "final_true_validation.csv")
++        if os.path.abspath(final_csv) != os.path.abspath(final_csv_copy):
++            shutil.copy2(final_csv, final_csv_copy)
++
++        requested_gcode_out = args.gcode_out or os.path.join(args.out_dir, "incremental_scale_optimized.gcode")
++        if final_gcode:
++            os.makedirs(os.path.dirname(os.path.abspath(requested_gcode_out)), exist_ok=True)
++            if os.path.abspath(final_gcode) != os.path.abspath(requested_gcode_out):
++                shutil.copy2(final_gcode, requested_gcode_out)
++
++        cumulative_path = os.path.join(args.out_dir, "cumulative_scale_by_seg_idx.csv")
++        cumulative_scale_table(original_csv, final_csv).to_csv(
++            cumulative_path, index=False, float_format="%.8f"
+         )
+ 
+-        F_new, P_new_ms, t_new, row_scale = solution_to_rows(rows, blocks, z_opt)
+-        alpha_pred = alpha_from_tau(tau_pred, tau_grid, alpha_grid) if tau_grid is not None else None
+-
+-        prediction_path, block_path = write_outputs(
+-            out_dir=args.out_dir,
+-            source_df=source_df,
+-            rows=rows,
+-            blocks=blocks,
+-            row_to_block=row_to_block,
+-            equations=equations,
+-            tau_pred=tau_pred,
+-            alpha_pred=alpha_pred,
+-            F_new=F_new,
+-            P_new_ms=P_new_ms,
+-            t_new=t_new,
+-            row_scale=row_scale,
+-            z=z_opt,
+-        )
+-
+-        patched_info = None
+-        gcode_out = args.gcode_out
+-        if args.gcode_in:
+-            if not gcode_out:
+-                gcode_out = os.path.join(args.out_dir, "sparse_optimized.gcode")
+-            patched, expected = patch_gcode_by_segidx(
+-                args.gcode_in, gcode_out, rows, F_new, P_new_ms,
+-                args.enable_travel_opt, args.enable_dwell_opt,
+-            )
+-            patched_info = {"patched": patched, "expected": expected, "coverage": patched / max(1, expected)}
+-            print(f"Patched G-code: {patched}/{expected} lines -> {gcode_out}")
+-            if expected > 0 and patched < 0.98 * expected:
+-                print("Warning: G-code patch coverage is below 98%")
+-
+-        true_comparison = None
+-        true_files = None
+-        if args.true_validate:
+-            assert gcode_out is not None
+-            validation_csv, validation_gcode = run_true_validation(
+-                module_name=args.true_builder_module,
+-                gcode_in=gcode_out,
+-                out_dir=args.out_dir,
+-                V_nozzle=args.vnozzle,
+-                d_filament=args.d_filament,
+-                e_mode=args.e_mode,
+-            )
+-            true_comparison = compare_true_validation(validation_csv, equations, tau_pred)
+-            true_files = {"csv": validation_csv, "gcode": validation_gcode}
+-            print(
+-                "TRUE validation: "
+-                f"RMSE={true_comparison['true_minus_pred_rmse_s']:.6f}s, "
+-                f"max_abs={true_comparison['true_minus_pred_abs_max_s']:.6f}s"
+-            )
+-
+         total_sec = time.perf_counter() - started_total
+         summary = {
+-            "input": os.path.abspath(args.input),
++            "input": original_csv,
+             "gcode_in": os.path.abspath(args.gcode_in) if args.gcode_in else None,
+-            "gcode_out": os.path.abspath(gcode_out) if gcode_out else None,
+-            "feedrate_bounds": {
+-                "extrusion": {
+-                    "Fmin_mm_per_min": args.Fmin_extrusion_resolved,
+-                    "Fmax_mm_per_min": args.Fmax_extrusion_resolved,
+-                },
+-                "travel": {
+-                    "enabled": bool(args.enable_travel_opt),
+-                    "Fmin_mm_per_min": args.Fmin_travel_resolved,
+-                    "Fmax_mm_per_min": args.Fmax_travel_resolved,
+-                },
++            "gcode_out": os.path.abspath(requested_gcode_out) if final_gcode else None,
++            "mode": {
++                "optimization_variable": "explicit_incremental_block_time_scale",
++                "scale_interpretation": "1=current timing, >1 slower, <1 faster",
++                "iterations_requested": args.iterations,
++                "attempts_completed": len(history),
++                "accepted_rounds": accepted_rounds,
++                "true_fifo_relinearization": run_true_each_round,
+             },
+             "target": {
+                 "tau_min": tau_lo,
+@@ -1623,29 +2123,41 @@
+                 "alpha_max": args.alpha_max,
+                 "alpha_buffer": args.alpha_buffer,
+             },
+-            "model": model_diag,
+-            "row_count": len(rows),
+-            "control_block_count": len(blocks),
+-            "baseline_reconstruction_abs_max_s": reconstruction_abs_max,
+-            "stage1": {
+-                "elapsed_s": stage1_sec,
+-                "minimal_worst_violation_s": vmax_star,
+-                "solver_message": stage1.message,
++            "feedrate_bounds": {
++                "extrusion": {
++                    "Fmin_mm_per_min": args.Fmin_extrusion_resolved,
++                    "Fmax_mm_per_min": args.Fmax_extrusion_resolved,
++                },
++                "travel": {
++                    "enabled": bool(args.enable_travel_opt),
++                    "Fmin_mm_per_min": args.Fmin_travel_resolved,
++                    "Fmax_mm_per_min": args.Fmax_travel_resolved,
++                },
+             },
+-            "stage2": {
+-                "elapsed_s": stage2_sec,
+-                "allowed_worst_violation_s": vmax_upper,
+-                "solver_message": stage2.message,
+-                "target_sample_count": len(meta2["target_indices"]),
++            "increment_learning": {
++                "initial_scale_limit": args.increment_scale_limit,
++                "final_scale_limit": radius,
++                "minimum_scale_limit": args.min_increment_scale_limit,
++                "maximum_scale_limit": args.max_increment_scale_limit,
++                "trust_shrink": args.trust_shrink,
++                "trust_grow": args.trust_grow,
++                "accept_tolerance_s": args.accept_tolerance_s,
++                "patience": args.patience,
++                "acceptance_priority": [
++                    "true_vmax_s",
++                    "true_violation_count",
++                    "true_violation_sum_s",
++                    "true_mean_abs_target_error_s",
++                ],
+             },
+-            "baseline_metrics": baseline_metrics,
+-            "optimized_metrics": optimized_metrics,
+-            "patch": patched_info,
+-            "true_validation": true_comparison,
+-            "true_files": true_files,
++            "initial_true_metrics": initial_true_metrics,
++            "final_true_metrics": current_true_metrics,
++            "history": history,
+             "outputs": {
+-                "prediction_csv": os.path.abspath(prediction_path),
+-                "block_csv": os.path.abspath(block_path),
++                "final_true_csv": os.path.abspath(final_csv_copy),
++                "final_gcode": os.path.abspath(requested_gcode_out) if final_gcode else None,
++                "incremental_history_csv": os.path.abspath(history_path),
++                "cumulative_scale_csv": os.path.abspath(cumulative_path),
+             },
+             "total_elapsed_s": total_sec,
+         }
+@@ -1653,10 +2165,20 @@
+         with open(summary_path, "w", encoding="utf-8") as f:
+             json.dump(summary, f, ensure_ascii=False, indent=2)
+ 
+-        print(f"Prediction CSV: {prediction_path}")
+-        print(f"Block CSV:      {block_path}")
+-        print(f"Summary JSON:   {summary_path}")
+-        print(f"Total elapsed:  {total_sec:.3f}s")
++        print("=" * 78)
++        final_metric_label = "Final TRUE" if run_true_each_round else "Final predicted"
++        print(
++            f"{final_metric_label}: within={current_true_metrics['within_percent']:.3f}% "
++            f"violations={current_true_metrics['violation_count']:,} "
++            f"vmax={current_true_metrics['vmax_s']:.6f}s"
++        )
++        print(f"Accepted rounds: {accepted_rounds}/{len(history)}")
++        print(f"Final G-code:     {requested_gcode_out if final_gcode else 'not generated'}")
++        print(f"Final reference CSV: {final_csv_copy}")
++        print(f"History CSV:      {history_path}")
++        print(f"Cumulative scale: {cumulative_path}")
++        print(f"Summary JSON:     {summary_path}")
++        print(f"Total elapsed:    {total_sec:.3f}s")
+         print("=" * 78)
+         return 0
+ 
