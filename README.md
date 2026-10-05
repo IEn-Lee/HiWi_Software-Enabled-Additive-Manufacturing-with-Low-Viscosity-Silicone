@@ -38,6 +38,25 @@ This research bridges that gap through a Python-based G-code post-processing too
 This approach separates geometric toolpath generation from material-specific process optimization, allowing established slicing tools to be combined with a model that accounts for the evolving material state.
 
 
+## Workflow
+
+Generate G-code using a conventional FDM slicer, then process it with the optimizer to adapt it for RTV-2 silicone printing.
+
+```mermaid
+flowchart TD
+    A["3D Geometry"] --> B["Conventional FDM Slicer"]
+    B --> C["Standard FDM G-code"]
+    C --> D["RTV-2 G-code Optimizer"]
+    D --> E["RTV-2-specific G-code"]
+    E --> F["RTV-2 Silicone 3D Printing"]
+    F --> G["Printed Result"]
+
+    style D fill:#dbeafe,stroke:#2563eb,stroke-width:3px,color:#172554
+```
+
+**No dedicated slicer is required.** The optimizer adds material-specific processing to the existing FDM slicing workflow.
+
+
 ## Process Challenge
 
 The material state of RTV-2 silicone evolves after mixing and depends on its residence time and thermal history. During printing, material associated with different extrusion segments may experience different residence times, resulting in inconsistent material conditions at deposition.
