@@ -1,3 +1,13 @@
+## Project Documentation
+
+
+- **Illustrated Overview:** [Explore the project with figures and explanations](https://github.com/IEn-Lee/Research-Assistant_Software-Enabled-Additive-Manufacturing-with-Low-Viscosity-Silicone/blob/main/Silicone%20Additive%20Manufacturing%20Portfolio.pdf)<br>
+*(If GitHub fails to display the PDF preview, please download the file and open it locally)*
+
+
+---
+
+
 # RTV-2 Silicone G-code Optimizer
 
 A Python tool to convert FDM-style G-code into RTV-2 silicone-compatible toolpaths, with curing-aware optimization.
