@@ -20,9 +20,9 @@ Friedrich-Alexander-Universität Erlangen-Nürnberg (FAU)
 
 ## Overview
 
-This research focused on improving **extrusion-based additive manufacturing with low-viscosity silicone** through process modeling, software-based optimization, and experimental validation.
+This research focused on improving extrusion-based additive manufacturing with **low-viscosity, two-component RTV-2 silicone** through process modeling, G-code optimization, and experimental validation.
 
-My work connected material residence time and thermal history to changes in material behavior, using these relationships to improve material conditioning consistency and printing performance.
+The developed Python tool links material residence time and thermal history to material-state evolution, using these relationships to optimize printing parameters across extrusion segments. The goal is to improve material conditioning consistency and deposition quality while retaining a conventional FDM slicing workflow.
 
 
 ## Why This Research Is Needed
@@ -57,13 +57,6 @@ flowchart TD
 **No dedicated slicer is required.** The optimizer adds material-specific processing to the existing FDM slicing workflow.
 
 
-## Process Challenge
-
-The material state of RTV-2 silicone evolves after mixing and depends on its residence time and thermal history. During printing, material associated with different extrusion segments may experience different residence times, resulting in inconsistent material conditions at deposition.
-
-The objective of this work was to reduce these differences through model-based process optimization, helping maintain more consistent material conditions and printed-segment quality throughout the toolpath.
-
-
 ## My Contributions
 
 - Developed a Python tool to process FDM-style G-code for RTV-2 silicone extrusion printing.
@@ -74,9 +67,7 @@ The objective of this work was to reduce these differences through model-based p
 
 ## 1. Improving Consistency During Extrusion
 
-A key objective was to maintain more consistent material conditions throughout the printing process. Variations in residence time and thermal history can affect the state of the silicone as it reaches the extrusion outlet, influencing flow behavior and print quality.
-
-I developed a predictive process-modeling framework and applied PID-based optimization to improve consistency across extrusion segments.
+I combined residence-time modeling with PID-based optimization of segment-level feedrates to reduce variation in material residence time across the printing sequence.
 
 <p align="center">
   <img src="Images/Silicone_Material_Conditioning_Stability.png" alt="Residence-time stability index before and after process optimization" width="850">
